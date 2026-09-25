@@ -1,7 +1,29 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
+import type {
+  CredentialsAndIdentityIdProvider,
+  TokenProvider,
+} from "@aws-amplify/core";
 
-interface SessionPayload extends Record<string, unknown> {
+/**
+ * The JSON value model. Amplify does not export its `JwtPayload`/`JsonObject`
+ * from the package root either, so this shape is restated rather than imported.
+ * It has to mirror Amplify's exactly: `Token.payload` is typed as a `JsonObject`,
+ * so a `Record<string, unknown>` index signature is *not* assignable to it and
+ * would make these providers unusable by `Amplify.configure`. The provider
+ * interfaces below are imported, so the part of the contract that can actually
+ * drift is enforced rather than restated; the
+ * `returns library options that Amplify.configure accepts` test in
+ * `test/helpers/local/amplify-local-session.test.ts` is the compile-time proof
+ * that this restatement is assignable to Amplify's real `LibraryOptions`.
+ */
+type JsonPrimitive = null | string | number | boolean;
+type JsonArray = (JsonPrimitive | JsonObject | JsonArray)[];
+interface JsonObject {
+  [key: string]: JsonPrimitive | JsonArray | JsonObject;
+}
+
+interface SessionPayload extends JsonObject {
   exp: number;
 }
 
@@ -12,48 +34,24 @@ export interface SessionResponse {
 }
 
 /**
- * The two provider contracts below are structural restatements of Amplify's
- * `TokenProvider` and `CredentialsAndIdentityIdProvider`. Amplify keeps those
- * types in `@aws-amplify/core`, which is not a declared dependency of this
- * workspace and does not export `LibraryAuthOptions` (the type both providers
- * hang off) from its entry point — so importing them would reach into an
- * undeclared transitive package for a contract this small. `Amplify.configure`
- * re-checks the object these providers build against the real types at the one
- * place it is installed, so drift still fails the build there.
+ * Narrows an untrusted `/session` body before it is cached. The edge is ours,
+ * but a misconfigured `VITE_LOCAL_SESSION_ENDPOINT` or a dev proxy can answer
+ * with some other JSON entirely; without this a bad body would be cached and
+ * then throw from `isExpired` on every later call, wedging the provider until
+ * sign-out.
  */
-interface Token {
-  payload: SessionPayload;
-  toString(): string;
-}
-
-interface AuthTokens {
-  idToken?: Token;
-  accessToken: Token;
-}
-
-interface TokenProvider {
-  getTokens(): Promise<AuthTokens | null>;
-}
-
-interface Credentials {
-  accessKeyId: string;
-  secretAccessKey: string;
-  sessionToken?: string;
-  expiration?: Date;
-}
-
-interface CredentialsAndIdentityIdProvider {
-  /** The options are unused: the local session never varies by request. */
-  getCredentialsAndIdentityId(
-    options: unknown,
-  ): Promise<CredentialsAndIdentityId | undefined>;
-  clearCredentialsAndIdentityId(): void;
-}
-
-interface CredentialsAndIdentityId {
-  credentials: Credentials;
-  identityId?: string;
-}
+const isSessionResponse = (value: unknown): value is SessionResponse => {
+  if (typeof value !== "object" || value === null) return false;
+  if (!("token" in value) || typeof value.token !== "string") return false;
+  if (
+    !("payload" in value) ||
+    typeof value.payload !== "object" ||
+    value.payload === null
+  ) {
+    return false;
+  }
+  return "exp" in value.payload && typeof value.payload.exp === "number";
+};
 
 /**
  * Amplify session for the offline LocalStack profile.
@@ -72,8 +70,8 @@ interface CredentialsAndIdentityId {
  */
 export function localSessionLibraryOptions(sessionEndpoint: string): {
   Auth: {
-    tokenProvider?: TokenProvider;
-    credentialsProvider?: CredentialsAndIdentityIdProvider;
+    tokenProvider: TokenProvider;
+    credentialsProvider: CredentialsAndIdentityIdProvider;
   };
 } {
   let cached: SessionResponse | null = null;
@@ -89,9 +87,10 @@ export function localSessionLibraryOptions(sessionEndpoint: string): {
       try {
         const response = await fetch(sessionEndpoint, { cache: "no-store" });
         if (!response.ok) return null;
-        const session = (await response.json()) as SessionResponse;
-        cached = session;
-        return session;
+        const body: unknown = await response.json();
+        if (!isSessionResponse(body)) return null;
+        cached = body;
+        return body;
       } catch {
         // The local edge not running is a normal state, not an error: the app
         // should render logged out rather than crash.
@@ -105,12 +104,15 @@ export function localSessionLibraryOptions(sessionEndpoint: string): {
   };
 
   const tokenProvider: TokenProvider = {
+    // `forceRefresh` is deliberately ignored: the local identity is stable for
+    // the life of the edge's key, so an explicit re-read buys nothing and the
+    // `exp` check already refreshes a lapsed token.
     getTokens: async () => {
       const session = await loadSession();
       if (!session) return null;
       // `JWT` is type-only in aws-amplify 6.16.4, so a structural object
       // satisfying `{ payload, toString() }` is what AuthTokens accepts.
-      const toToken = (): Token => ({
+      const toToken = () => ({
         payload: session.payload,
         toString: () => session.token,
       });
