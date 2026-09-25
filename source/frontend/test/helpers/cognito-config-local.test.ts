@@ -33,7 +33,6 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.unstubAllEnvs();
-  vi.unstubAllGlobals();
 });
 
 describe("configureAmplifyAuth", () => {
@@ -97,6 +96,9 @@ describe("configureAmplifyAuth", () => {
 
   it("requests the configured endpoint without its surrounding whitespace", async () => {
     vi.stubEnv("VITE_LOCAL_SESSION_ENDPOINT", `  ${ENDPOINT}\n`);
+    // Real provider, real session shape: the trimmed endpoint is only
+    // observable by driving the provider, so the body mirrors the local edge's
+    // `GET /session` response rather than mocking the provider out.
     const fetchMock = vi.fn().mockResolvedValue({
       ok: true,
       json: async () => ({
@@ -104,13 +106,21 @@ describe("configureAmplifyAuth", () => {
         payload: { exp: Math.floor(Date.now() / 1000) + 3600 },
       }),
     });
-    vi.stubGlobal("fetch", fetchMock);
+    // Borrowed and handed back, rather than `vi.stubGlobal` plus a blanket
+    // `unstubAllGlobals` in afterEach, which would also drop the
+    // `SOLUTION_VERSION` stub that `src/setupTests.tsx` installed.
+    const sharedFetch = globalThis.fetch;
+    globalThis.fetch = fetchMock;
 
-    configureAmplifyAuth(baseConfig);
-    const [, libraryOptions] = configure.mock.calls[0];
-    const tokens = await libraryOptions.Auth.tokenProvider.getTokens();
+    try {
+      configureAmplifyAuth(baseConfig);
+      const [, libraryOptions] = configure.mock.calls[0];
+      const tokens = await libraryOptions.Auth.tokenProvider.getTokens();
 
-    expect(fetchMock).toHaveBeenCalledWith(ENDPOINT, { cache: "no-store" });
-    expect(tokens?.idToken?.toString()).toBe("h.p.s");
+      expect(fetchMock).toHaveBeenCalledWith(ENDPOINT, { cache: "no-store" });
+      expect(tokens?.idToken?.toString()).toBe("h.p.s");
+    } finally {
+      globalThis.fetch = sharedFetch;
+    }
   });
 });

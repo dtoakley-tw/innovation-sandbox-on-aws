@@ -1,7 +1,7 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import type { ResourcesConfig } from "@aws-amplify/core";
+import type { ResourcesConfig } from "aws-amplify";
 import { Amplify } from "aws-amplify";
 import { cognitoUserPoolsTokenProvider } from "aws-amplify/auth/cognito";
 import { sessionStorage } from "aws-amplify/utils";
@@ -24,17 +24,12 @@ export interface CognitoConfig {
 export function configureAmplifyAuth(cognitoConfig: CognitoConfig): void {
   const currentOrigin = globalThis.location.origin;
 
-  // Set only by the offline local profile and trimmed so an empty value in
-  // .env.local reads as unset. Unset in every deployed environment, where the
-  // local session providers are not configured and login proceeds through the
-  // Cognito hosted UI.
+  // Dev-only and unset in every deployment; trimmed so an empty .env.local entry reads as unset.
   const localSessionEndpoint = (
     import.meta.env.VITE_LOCAL_SESSION_ENDPOINT as string | undefined
   )?.trim();
 
-  // Annotated because the literal is no longer in argument position: without it
-  // `responseType` widens to `string` and the object stops matching the config
-  // type `Amplify.configure` expects.
+  // Annotated because out of argument position `responseType` widens to string.
   const resources: ResourcesConfig = {
     Auth: {
       Cognito: {
