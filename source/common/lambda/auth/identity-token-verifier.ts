@@ -66,7 +66,10 @@ async function ensureLocalJwks(env: IdentityVerifierEnv): Promise<void> {
     .then((jwks) => {
       // Seeds the in-memory cache keyed by the Cognito issuer derived from the
       // pool id, so the verifier never issues the network request it would
-      // otherwise make.
+      // otherwise make. The two-argument form is deliberate: it throws if the
+      // pool id is not one of the verifier's configured issuers, where the
+      // one-argument form would silently miss. COGNITO_USER_POOL_ID is fixed for
+      // the life of an execution environment, so a mismatch is always a bug.
       getVerifier(env).cacheJwks(jwks, env.COGNITO_USER_POOL_ID);
     })
     .catch((error: unknown) => {

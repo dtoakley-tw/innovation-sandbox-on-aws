@@ -2,16 +2,27 @@
 // SPDX-License-Identifier: Apache-2.0
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-const cacheJwks = vi.fn();
+const cacheJwks = vi.fn<(jwks: unknown, userPoolId?: string) => void>();
 const fetchJwks = vi.fn();
+
+// The pool id the verifier is configured with. `cacheJwks` must be handed this
+// same id: the library keys the JWKS cache by the issuer it derives from it, so
+// a different id would write the keys under a URI the verifier never reads.
+interface VerifierProps {
+  userPoolId: string;
+  tokenUse: "id";
+  clientId: string;
+}
+
+const createVerifier = vi.fn((_props: VerifierProps) => ({
+  verify: async (token: string) =>
+    JSON.parse(Buffer.from(token, "base64").toString("utf-8")),
+  cacheJwks,
+}));
 
 vi.mock("aws-jwt-verify", () => ({
   CognitoJwtVerifier: {
-    create: () => ({
-      verify: async (token: string) =>
-        JSON.parse(Buffer.from(token, "base64").toString("utf-8")),
-      cacheJwks,
-    }),
+    create: createVerifier,
   },
 }));
 
@@ -41,7 +52,18 @@ const baseEnv = {
   COGNITO_APP_CLIENT_ID: "localdevclientid",
 };
 
+// The verifier and `localJwksReady` are module state, so a test that needs its
+// own pristine instance — and therefore its own `create` / `fetchJwks` /
+// `cacheJwks` call counts — clears the registry and re-imports.
+const importFreshVerifier = async () => {
+  vi.resetModules();
+  const module =
+    await import("@amzn/innovation-sandbox-commons/lambda/auth/identity-token-verifier.js");
+  return module.verifyAndExtractClaims;
+};
+
 beforeEach(() => {
+  createVerifier.mockClear();
   cacheJwks.mockClear();
   fetchJwks.mockReset();
   fetchJwks.mockResolvedValue({ keys: [{ kid: "local" }] });
@@ -51,6 +73,11 @@ afterEach(() => {
   vi.resetModules();
 });
 
+// Tests 2 and 4 own a pristine module instance (see `importFreshVerifier`), so
+// their call counts are attributable to that test and they do not depend on the
+// order the suite runs in. Tests 1 and 3 share the top-level instance and
+// assert only that no fetch happens / the claims come back, which holds either
+// way round.
 describe("local JWKS injection", () => {
   it("never fetches or caches a JWKS when ISB_LOCAL_JWKS_URI is unset", async () => {
     await verifyAndExtractClaims(buildEvent(), baseEnv);
@@ -59,7 +86,8 @@ describe("local JWKS injection", () => {
   });
 
   it("fetches the configured JWKS and seeds the verifier cache", async () => {
-    await verifyAndExtractClaims(buildEvent(), {
+    const verify = await importFreshVerifier();
+    await verify(buildEvent(), {
       ...baseEnv,
       ISB_LOCAL_JWKS_URI: JWKS_URI,
     });
@@ -70,6 +98,12 @@ describe("local JWKS injection", () => {
       { keys: [{ kid: "local" }] },
       POOL_ID,
     );
+    // The keys are only found again if they are cached against the same pool id
+    // the verifier was configured with, so assert that relationship rather than
+    // two literals that could drift apart.
+    const configuredPoolId = createVerifier.mock.calls[0]?.[0].userPoolId;
+    expect(configuredPoolId).toBe(POOL_ID);
+    expect(cacheJwks.mock.calls[0]?.[1]).toBe(configuredPoolId);
   });
 
   it("still returns the verified claims after injection", async () => {
@@ -81,11 +115,7 @@ describe("local JWKS injection", () => {
   });
 
   it("retries the fetch after a failure instead of caching the rejection", async () => {
-    // A fresh module instance: `localJwksReady` is module state, and the tests
-    // above have already resolved it.
-    vi.resetModules();
-    const { verifyAndExtractClaims: verify } =
-      await import("@amzn/innovation-sandbox-commons/lambda/auth/identity-token-verifier.js");
+    const verify = await importFreshVerifier();
     const env = { ...baseEnv, ISB_LOCAL_JWKS_URI: JWKS_URI };
 
     fetchJwks.mockRejectedValueOnce(new Error("local edge unreachable"));

@@ -44,8 +44,9 @@ vi.mock("aws-jwt-verify", () => ({
   CognitoJwtVerifier: {
     create: () => ({
       verify: async (token: string) => decodeTestToken(token),
-      // No-op: `cacheJwks` is only reached when ISB_LOCAL_JWKS_URI is set, which
-      // no upstream test does. Declared so the verifier interface is complete.
+      // Reached: several API handler suites populate ISB_LOCAL_JWKS_URI with a
+      // generated string (see the `aws-jwt-verify/jwk` mock below). A no-op
+      // because the verifier that would consume these keys is stubbed here.
       cacheJwks: () => {},
     }),
   },
