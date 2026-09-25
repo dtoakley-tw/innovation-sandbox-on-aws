@@ -9,6 +9,13 @@ export const BaseApiLambdaEnvironmentSchema =
     COGNITO_USER_POOL_ID: z.string().min(1),
     COGNITO_APP_CLIENT_ID: z.string().min(1),
     ISB_NAMESPACE: z.string().regex(new RegExp(NAMESPACE_PATTERN)),
+    /**
+     * Local development only. When set, the identity verifier loads JWKS from
+     * this URI instead of reaching cognito-idp.<region>.amazonaws.com, which is
+     * unreachable in the offline LocalStack profile. Unset in every deployed
+     * environment, where the verifier behaves exactly as before.
+     */
+    ISB_LOCAL_JWKS_URI: z.string().optional(),
   });
 
 export type BaseApiLambdaEnvironment = z.infer<
