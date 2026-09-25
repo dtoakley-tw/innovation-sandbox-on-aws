@@ -79,4 +79,28 @@ describe("local JWKS injection", () => {
     });
     expect(result).toEqual(claims);
   });
+
+  it("retries the fetch after a failure instead of caching the rejection", async () => {
+    // A fresh module instance: `localJwksReady` is module state, and the tests
+    // above have already resolved it.
+    vi.resetModules();
+    const { verifyAndExtractClaims: verify } =
+      await import("@amzn/innovation-sandbox-commons/lambda/auth/identity-token-verifier.js");
+    const env = { ...baseEnv, ISB_LOCAL_JWKS_URI: JWKS_URI };
+
+    fetchJwks.mockRejectedValueOnce(new Error("local edge unreachable"));
+    // The failure propagates — it is not swallowed into a bare 401.
+    await expect(verify(buildEvent(), env)).rejects.toThrow(
+      "local edge unreachable",
+    );
+
+    // The rejection must not be cached, or a single transient local-edge outage
+    // would fail every request until the container is recycled.
+    await verify(buildEvent(), env);
+    expect(fetchJwks).toHaveBeenCalledTimes(2);
+    expect(cacheJwks).toHaveBeenCalledWith(
+      { keys: [{ kid: "local" }] },
+      POOL_ID,
+    );
+  });
 });
