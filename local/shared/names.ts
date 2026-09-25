@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 /**
- * Every local resource name and endpoint in one place. Tasks 2 through 8 import
- * from here rather than inventing names, so a rename lands in exactly one file.
+ * Every local resource name and endpoint in one place. Tasks 4, 7, 8, 9, 10, and
+ * 12 import from here rather than inventing names, so a rename lands in exactly
+ * one file.
  *
  * Names deliberately mirror the production CDK constructs in
  * `source/infrastructure/lib/isb-data-resources.ts` — the table count, key
