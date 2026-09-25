@@ -15,6 +15,7 @@ import { loadOrCreateKeyPair } from "./jwks.js";
 import { LOCAL_ISSUER, mintLocalIdToken } from "./mint-token.js";
 
 let dir: string;
+const originalEnv = process.env.ISB_LOCAL_KEY_DIR;
 
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "isb-local-mint-"));
@@ -22,6 +23,8 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  if (originalEnv === undefined) delete process.env.ISB_LOCAL_KEY_DIR;
+  else process.env.ISB_LOCAL_KEY_DIR = originalEnv;
   rmSync(dir, { recursive: true, force: true });
 });
 

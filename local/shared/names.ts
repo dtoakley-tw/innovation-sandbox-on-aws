@@ -32,6 +32,17 @@ export const LOCAL_TABLE_NAMES = [
 
 export type LocalTableName = (typeof LOCAL_TABLE_NAMES)[number];
 
+/**
+ * Mirrors `IsbRoleSchema` in `source/shared/utils/auth-utils.ts`, which `local/`
+ * cannot import (no `paths` mapping, and the type is not re-exported from a
+ * package entry point). Restated here so a role typo in the local edge is a
+ * compile error rather than a 403 that reads like an RBAC bug. `names.test.ts`
+ * pins this list to the production enum so the mirror cannot drift.
+ */
+export const LOCAL_ROLE_NAMES = ["Admin", "Manager", "User"] as const;
+
+export type LocalIsbRole = (typeof LOCAL_ROLE_NAMES)[number];
+
 /** Maps each construct's table to the `*_TABLE_NAME` the Lambdas read. */
 export const localTableNames: Record<LocalTableName, string> = {
   sandboxAccount: `${LOCAL_NAMESPACE}-sandbox-account`,

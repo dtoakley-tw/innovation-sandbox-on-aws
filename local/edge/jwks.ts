@@ -41,16 +41,20 @@ const keyFilePath = () =>
  * opaque signing failure, so fail here with the one command that fixes it.
  */
 const readKeyPair = (keyFile: string): KeyPair => {
-  const unusable = (): never => {
+  const unusable = (cause?: unknown): never => {
     throw new Error(
-      `Local signing key at ${keyFile} is unreadable or incomplete. Delete it and run \`npm run local:reset\` to mint a new one.`,
+      `Local signing key at ${keyFile} is corrupt or incomplete. Delete it and run \`npm run local:reset\` to mint a new one.`,
+      { cause },
     );
   };
+  // Read outside the try: a permissions failure needs a chmod, not a delete,
+  // and it carries its own errno worth surfacing verbatim.
+  const contents = readFileSync(keyFile, "utf-8");
   let parsed: unknown;
   try {
-    parsed = JSON.parse(readFileSync(keyFile, "utf-8"));
-  } catch {
-    return unusable();
+    parsed = JSON.parse(contents);
+  } catch (e) {
+    return unusable(e);
   }
   const candidate = parsed as Partial<KeyPair>;
   if (!candidate?.privateKey || !candidate?.publicKey || !candidate?.kid) {
@@ -89,7 +93,9 @@ export async function loadOrCreateKeyPair(): Promise<KeyPair> {
     kid,
   };
   mkdirSync(dirname(keyFile), { recursive: true });
-  writeFileSync(keyFile, JSON.stringify(keyPair, null, 2));
+  // 0600: the file holds the private key, which has no business being
+  // world-readable on a shared machine.
+  writeFileSync(keyFile, JSON.stringify(keyPair, null, 2), { mode: 0o600 });
   return keyPair;
 }
 

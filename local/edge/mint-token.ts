@@ -2,7 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 import { createSign } from "node:crypto";
 
-import { LOCAL_APP_CLIENT_ID, LOCAL_USER_POOL_ID } from "../shared/names.js";
+import {
+  LOCAL_APP_CLIENT_ID,
+  LOCAL_USER_POOL_ID,
+  type LocalIsbRole,
+} from "../shared/names.js";
 import type { KeyPair } from "./jwks.js";
 
 /**
@@ -17,7 +21,9 @@ export interface MintOptions {
   keyPair: KeyPair;
   sub: string;
   email: string;
-  roles: string[];
+  // Constrained to the production role enum, and readonly so a caller holding a
+  // `const` array (e.g. Task 7's `["Admin"] as const`) can pass it directly.
+  roles: readonly LocalIsbRole[];
   ttlSeconds?: number;
 }
 

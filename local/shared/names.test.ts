@@ -1,6 +1,7 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 import { NAMESPACE_PATTERN } from "@amzn/innovation-sandbox-commons/types/isb-types.js";
+import { IsbRoleSchema } from "@amzn/innovation-sandbox-shared/utils/auth-utils.js";
 import { describe, expect, it } from "vitest";
 
 import {
@@ -8,6 +9,7 @@ import {
   LOCAL_EDGE_PORT,
   LOCAL_NAMESPACE,
   LOCAL_REGION,
+  LOCAL_ROLE_NAMES,
   LOCAL_STAGE,
   localEdgeConfig,
   localResourceNames,
@@ -22,6 +24,12 @@ describe("local shared names", () => {
   it("gives every table a distinct name", () => {
     const names = Object.values(localTableNames);
     expect(new Set(names).size).toBe(names.length);
+  });
+
+  // LOCAL_ROLE_NAMES restates IsbRoleSchema because local/ cannot import the
+  // type. This is the only thing keeping the two lists in step.
+  it("mirrors the production IsbRole enum exactly", () => {
+    expect([...LOCAL_ROLE_NAMES]).toEqual([...IsbRoleSchema.options]);
   });
 });
 
