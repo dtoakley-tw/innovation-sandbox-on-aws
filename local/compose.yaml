@@ -7,16 +7,30 @@ services:
     image: localstack/localstack:4
     ports:
       - "4566:4566"
+    networks:
+      - isb-local
     environment:
       # Free tier. No SERVICES list so every available service is loaded.
       DEBUG: "0"
       LAMBDA_RUNTIME_ENVIRONMENT_TIMEOUT: "60"
       # A marker so this container is identifiable as the local one in
-      # `docker ps`. Nothing reads it; being on this compose network, not this
+      # `docker ps`. Nothing reads it; being on the isb-local network, not this
       # variable, is what lets the Lambda containers reach the edge by name.
       ISB_LOCAL: "1"
-    # Deliberately no volumes: `local:reset` recreates the containers, which
-    # is unambiguous in a way that selectively deleting tables is not.
+      # The network LocalStack attaches the Lambda containers it starts to.
+      # They have to resolve `isb-local-edge` (the JWKS fetch on every cold
+      # start) and `localstack` (every AWS SDK call, via AWS_ENDPOINT_URL) by
+      # name, and on Docker's default bridge neither name exists. Must equal the
+      # `name` of the network declared at the bottom of this file.
+      LAMBDA_DOCKER_NETWORK: "isb-local"
+    volumes:
+      # The Docker socket: LocalStack executes Lambda by starting real
+      # containers on the host daemon, and the current provider has no
+      # non-Docker fallback, so without this bind no Lambda starts at all. A
+      # host resource bound into a local development container — not a place
+      # LocalStack keeps data. Its state stays inside the container, which is
+      # what makes `local:reset` unambiguously a matter of recreating them.
+      - /var/run/docker.sock:/var/run/docker.sock
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:4566/_localstack/health"]
       interval: 5s
@@ -31,11 +45,15 @@ services:
       # The browser's route in. 4599 mirrors LOCAL_EDGE_PORT in
       # local/shared/names.ts, which the shell and the Vite proxy also use.
       - "4599:4599"
+    networks:
+      # The same network the Lambda containers join, so a Lambda fetching the
+      # JWKS reaches the edge by service name rather than by localhost.
+      - isb-local
     environment:
       # `localstack`, not `localhost`: the Lambdas this forwards to run as
-      # containers on this network, and inside a container localhost is the
-      # Lambdas' own. The same process is published on the host port above for
-      # the browser — the two addresses are not an inconsistency.
+      # containers on the isb-local network, and inside a container localhost is
+      # the Lambdas' own. The same process is published on the host port above
+      # for the browser — the two addresses are not an inconsistency.
       #
       # `restapis/0` is a placeholder. The real id only exists once
       # `cdk deploy` has run, so `local-up.sh` recreates this service with it,
@@ -49,3 +67,14 @@ services:
     depends_on:
       localstack:
         condition: service_healthy
+
+# Declared explicitly rather than left to the compose default, because Docker
+# attaches the Lambda containers to a network by name and the only place
+# LocalStack learns that name is the environment variable above. The explicit
+# `name` is what keeps the two in step: without it compose prefixes the project
+# directory onto the key, so the network would be `local_isb-local` in a
+# checkout of this directory and something else in a checkout of any other. The
+# name is project-specific so two profiles on one machine cannot collide.
+networks:
+  isb-local:
+    name: isb-local

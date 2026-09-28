@@ -51,6 +51,48 @@ const withoutFunctions = (body: string, ...names: string[]): string =>
     body,
   );
 
+/**
+ * The text of one compose service, so a rule about "the localstack service"
+ * cannot be satisfied by a line belonging to some other service. Compose
+ * indents a service name two spaces and its keys four, so a service ends at the
+ * next line indented by fewer — the next service, or the next top-level key.
+ */
+const composeService = (name: string): string => {
+  const compose = read("compose.yaml");
+  const start = compose.match(new RegExp(`^ {2}${name}:\\n`, "m"))?.index;
+  if (start === undefined) {
+    throw new Error(`no ${name} service in compose.yaml`);
+  }
+  const rest = compose.slice(start + `  ${name}:`.length);
+  const end = rest.search(/^ {0,2}\S/m);
+  return rest.slice(0, end === -1 ? undefined : end);
+};
+
+/** The networks one service is attached to, by the names the file gives them. */
+const serviceNetworks = (name: string): string[] =>
+  composeList(name, "networks");
+
+/**
+ * The entries of a compose list key — `networks:`, `volumes:` — inside one
+ * service. Comment lines between the key and its entries belong to the block, so
+ * they are walked rather than mistaken for the end of it, and a following key is
+ * not one of them because it is neither a comment nor a `- ` entry.
+ */
+const composeList = (service: string, key: string): string[] =>
+  composeService(service)
+    .match(new RegExp(`^ {4}${key}:\\n((?: {4,}(?:#.*|- .+)\\n?)+)`, "m"))?.[1]
+    ?.match(/^ {4,}- (\S+)/gm)
+    ?.map((entry) => entry.replace(/^ *- /, "")) ?? [];
+
+/** The real Docker network name a top-level network is created with. */
+const declaredNetworkName = (key: string): string | undefined =>
+  read("compose.yaml").match(
+    new RegExp(
+      `^ {2}${key}:\\n(?: {4}.+\\n)*? {4}name:\\s*"?([^"\\n]+)"?`,
+      "m",
+    ),
+  )?.[1];
+
 describe("local compose profile", () => {
   it("declares LocalStack and the edge service the Lambdas address", () => {
     const compose = read("compose.yaml");
@@ -72,7 +114,37 @@ describe("local compose profile", () => {
 
   it("runs LocalStack without a persistent volume so reset is unambiguous", () => {
     const compose = read("compose.yaml");
-    expect(compose).not.toMatch(/^\s*-\s*localstack-data:/m);
+    // Not "no volumes at all": the Docker socket bind is a volume too, and a
+    // legitimate one. The property is that LocalStack's *state* is not mounted,
+    // so `local:reset` means "recreate the containers" unambiguously.
+    expect(compose).not.toMatch(/\/var\/lib\/localstack/);
+    const targets = composeList("localstack", "volumes").map(
+      (mount) => mount.split(":").pop() as string,
+    );
+    expect(targets).toEqual(["/var/run/docker.sock"]);
+  });
+
+  // LocalStack starts real Lambda containers on the host daemon, and there is
+  // no non-Docker fallback executor in the current provider. Without this bind
+  // no Lambda starts at all, and the profile fails at the first API call.
+  it("gives LocalStack the Docker socket it needs to execute Lambda", () => {
+    expect(composeList("localstack", "volumes")).toContain(
+      "/var/run/docker.sock:/var/run/docker.sock",
+    );
+  });
+
+  // The network name is untyped in a compose file: a typo passes every other
+  // check in this file and fails only when a Lambda tries to resolve the edge
+  // by name. So the occurrences are cross-checked against each other rather
+  // than against a literal — the assertion is about consistency, not spelling.
+  it("puts the Lambda containers on the network the edge is attached to", () => {
+    const network = composeService("localstack").match(
+      /LAMBDA_DOCKER_NETWORK:\s*"?([^"\n]+)"?/,
+    )?.[1];
+    expect(network).toBeDefined();
+    expect(serviceNetworks("localstack")).toContain(network);
+    expect(serviceNetworks("isb-local-edge")).toContain(network);
+    expect(declaredNetworkName(network as string)).toBe(network);
   });
 
   it("health-checks LocalStack on the endpoint local-up polls", () => {
