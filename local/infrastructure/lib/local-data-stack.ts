@@ -28,9 +28,16 @@ export interface LocalDataStackProps extends StackProps {
  * parameter, none of which the LocalStack Community (Hobby) tier serves.
  * Importing it would drag that whole unsupported surface into a profile whose
  * entire purpose is to run unmodified application code against local doubles.
- * The duplication is a copy of the *table definitions only* — that copy is
- * what the tests pin, so a schema change upstream fails here rather than
- * surfacing as a query that quietly returns nothing.
+ * The duplication is confined to the table definitions, and the tests pin every
+ * one of them, so a local edit to a key schema or an index fails here instead
+ * of surfacing as a query that quietly returns nothing. Drift from upstream is
+ * still a manual check: nothing compares this file to
+ * `isb-data-resources.ts` automatically.
+ *
+ * Production names no table, letting CloudFormation generate one so a retry
+ * after a rolled-back deploy cannot collide with a RETAINed table. The local
+ * profile is the opposite case — ephemeral, single-deployment, and addressed by
+ * name from the Lambda environment — so `localTableNames` supplies one.
  *
  * Production sets point-in-time recovery and deletion protection on every
  * table and retains them outside dev mode. The local profile is one ephemeral
@@ -59,6 +66,7 @@ export class LocalDataStack extends Stack {
       },
     ) =>
       new Table(this, `${name}Table`, {
+        // The name the Lambdas read from buildLocalEnv, not a generated one.
         tableName: localTableNames[name],
         partitionKey: key.partitionKey,
         ...(key.sortKey ? { sortKey: key.sortKey } : {}),
@@ -101,9 +109,6 @@ export class LocalDataStack extends Stack {
         ttl: "ttl",
       }),
       // One item per configuration section, keyed by { section, sk: "current" }.
-      // Production deliberately omits an explicit table name so a retry cannot
-      // collide with a RETAINed table; the local profile is a single ephemeral
-      // deployment the Lambdas address by name, so naming it is correct here.
       config: table("config", {
         partitionKey: { name: "section", type: AttributeType.STRING },
         sortKey: { name: "sk", type: AttributeType.STRING },
