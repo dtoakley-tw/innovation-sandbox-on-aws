@@ -32,6 +32,24 @@ type ForwardedRequestInit = Omit<RequestInit, "body" | "duplex"> & {
   duplex?: "half";
 };
 
+const causeOf = (error: unknown) =>
+  error instanceof Error ? error.message : String(error);
+
+/**
+ * The single response for every way a forward can fail. Without it the
+ * developer sees a blank page and a stack trace in the container log; with it,
+ * the response names the thing that is wrong.
+ */
+const unreachable = (res: ServerResponse, cause: string): void => {
+  res.writeHead(502, { "content-type": "application/json" });
+  res.end(
+    JSON.stringify({
+      status: "fail",
+      message: `Local edge could not reach the LocalStack API Gateway: ${cause}`,
+    }),
+  );
+};
+
 /**
  * Rewrites `/api/<path>` to the local API Gateway invoke URL and forwards the
  * request, mirroring what the CloudFront path behavior does in production: it
@@ -56,12 +74,26 @@ export function handleApiProxy(
     res.end(JSON.stringify({ status: "fail", message: "Not found" }));
     return;
   }
-  const path = originalUrl.slice("/api".length);
-  const target = new URL(`${invokeUrl}${path}`);
-  // `path` already carries the search string and `new URL` picks it up; the
-  // explicit assignment keeps that true even if the invoke URL later grows a
-  // query of its own, which would otherwise win over the caller's.
-  target.search = new URL(originalUrl, "http://localhost").search;
+  let target: URL;
+  try {
+    const path = originalUrl.slice("/api".length);
+    target = new URL(`${invokeUrl}${path}`);
+    // `path` already carries the search string and `new URL` picks it up; the
+    // explicit assignment keeps that true even if the invoke URL later grows a
+    // query of its own, which would otherwise win over the caller's.
+    target.search = new URL(originalUrl, "http://localhost").search;
+  } catch (error) {
+    // A stray space in an exported API id lands here. Unguarded, `new URL`
+    // throws out of the request handler, Node treats that as uncaught, and the
+    // process dies — so /healthz and every other route go with it and the
+    // browser just sees a connection reset. A misconfiguration is reported like
+    // any other unreachable gateway instead, naming the variable to fix.
+    unreachable(
+      res,
+      `ISB_LOCAL_API_GATEWAY_INVOKE_URL is not a usable URL (${JSON.stringify(invokeUrl)}): ${causeOf(error)}`,
+    );
+    return;
+  }
 
   const bodyless = BODYLESS_METHODS.has(req.method ?? "GET");
   const headers: Record<string, string> = {};
@@ -105,16 +137,6 @@ export function handleApiProxy(
       res.end(body);
     })
     .catch((error: unknown) => {
-      // Without this the developer sees a blank page and a stack trace in the
-      // container log; with it, the response names the thing that is wrong.
-      res.writeHead(502, { "content-type": "application/json" });
-      res.end(
-        JSON.stringify({
-          status: "fail",
-          message: `Local edge could not reach the LocalStack API Gateway: ${
-            error instanceof Error ? error.message : String(error)
-          }`,
-        }),
-      );
+      unreachable(res, causeOf(error));
     });
 }

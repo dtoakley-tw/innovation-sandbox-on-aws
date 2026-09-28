@@ -1,6 +1,7 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 import { createServer, type Server } from "node:http";
+import { basename } from "node:path";
 
 import { buildLocalJwks, type KeyPair } from "./jwks.js";
 import { handleApiProxy } from "./routes/api-proxy.js";
@@ -80,8 +81,9 @@ export function createLocalEdgeServer(deps: LocalEdgeDeps): Server {
   });
 }
 
-/** Entry point used by the compose service. */
-async function main(): Promise<void> {
+/** Entry point used by the compose service. Exported so a test can pin the
+ *  startup precondition without going through a real listen. */
+export async function main(): Promise<void> {
   const { loadOrCreateKeyPair } = await import("./jwks.js");
   const { LOCAL_EDGE_PORT } = await import("../shared/names.js");
   const invokeUrl = process.env.ISB_LOCAL_API_GATEWAY_INVOKE_URL;
@@ -101,7 +103,11 @@ async function main(): Promise<void> {
 
 // Only when launched directly: importing this module — from a test, or from a
 // future task that composes the edge — must not open a port as a side effect.
-if (process.argv[1]?.endsWith("server.ts")) {
+// Matched on the basename so the compiled `dist/edge/server.js` reaches main()
+// as well as the TypeScript source; anchoring on the extension pair is what
+// keeps `server.test.ts` from matching. Without the .js arm a build would exit
+// 0 with no server and no log.
+if (/server\.[jt]s$/.test(basename(process.argv[1] ?? ""))) {
   main().catch((error: unknown) => {
     console.error("[local-edge] failed to start", error);
     process.exit(1);
