@@ -28,11 +28,18 @@ export interface LocalDataStackProps extends StackProps {
  * parameter, none of which the LocalStack Community (Hobby) tier serves.
  * Importing it would drag that whole unsupported surface into a profile whose
  * entire purpose is to run unmodified application code against local doubles.
- * The duplication is confined to the table definitions, and the tests pin every
- * one of them, so a local edit to a key schema or an index fails here instead
- * of surfacing as a query that quietly returns nothing. Drift from upstream is
- * still a manual check: nothing compares this file to
- * `isb-data-resources.ts` automatically.
+ * The duplication is confined to the table definitions, and the tests in
+ * `local-data-stack.test.ts` pin every one of them, so a local edit to a key
+ * schema or an index fails there rather than at request time.
+ *
+ * Those tests pin the local copy only. Nothing cross-checks this file against
+ * `isb-data-resources.ts`, so the two can drift apart when production changes
+ * and no test notices. A divergence surfaces as a loud DynamoDB error at
+ * request time — `ValidationException` on a `PutItem` against a missing key
+ * attribute, `ResourceNotFoundException` for an index queried on the wrong
+ * table — never as a silently empty result, which is what makes the gap
+ * tolerable for now. Re-verify this file against the seven table definitions
+ * in `isb-data-resources.ts` whenever production changes them.
  *
  * Production names no table, letting CloudFormation generate one so a retry
  * after a rolled-back deploy cannot collide with a RETAINed table. The local

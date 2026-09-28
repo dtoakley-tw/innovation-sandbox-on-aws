@@ -25,7 +25,13 @@ beforeAll(() => {
 
 const tables = () => template.findResources("AWS::DynamoDB::Table");
 
-/** Index definitions keyed by name, flattened across the seven tables. */
+/**
+ * Index definitions keyed by name, each tagged with the table that owns it.
+ * The owner is part of the contract — `GroupIndex` on the wrong table is a
+ * different, non-functional index, not a differently-shaped version of the
+ * right one — so it is part of what the assertion pins rather than flattened
+ * away.
+ */
 const indexes = () =>
   Object.fromEntries(
     Object.values(tables()).flatMap((table) =>
@@ -37,6 +43,7 @@ const indexes = () =>
         }) => [
           gsi.IndexName,
           {
+            table: tableName(table),
             keys: gsi.KeySchema.map((key) => key.AttributeName),
             projection: gsi.Projection.ProjectionType,
           },
@@ -44,6 +51,12 @@ const indexes = () =>
       ),
     ),
   );
+
+/** The `localTableNames` key a table resource was created for, or its name. */
+const tableName = (table: { [key: string]: any }): string =>
+  Object.entries(localTableNames).find(
+    ([, name]) => name === table.Properties.TableName,
+  )?.[0] ?? table.Properties.TableName;
 
 describe("LocalDataStack", () => {
   it("creates exactly seven tables", () => {
@@ -69,22 +82,36 @@ describe("LocalDataStack", () => {
     });
   });
 
-  // Pinned exactly, not just "contains these": a GSI dropped, renamed, or
-  // given the wrong sort key synthesizes cleanly and only fails as a query that
-  // quietly returns nothing.
-  it("creates exactly the GSIs the production stores query", () => {
+  // Pinned exactly, not just "contains these": a GSI dropped, renamed, given
+  // the wrong sort key, or moved to another table synthesizes cleanly and only
+  // fails as a query against an index that table does not have.
+  it("creates exactly the GSIs the production stores query, on the right tables", () => {
     expect(indexes()).toEqual({
-      "blueprintId-index": { keys: ["blueprintId"], projection: "KEYS_ONLY" },
+      "blueprintId-index": {
+        table: "leaseTemplate",
+        keys: ["blueprintId"],
+        projection: "KEYS_ONLY",
+      },
       StatusIndex: {
+        table: "lease",
         keys: ["status", "originalLeaseTemplateUuid"],
         projection: "ALL",
       },
       "itemType-blueprintId-index": {
+        table: "blueprint",
         keys: ["itemType", "blueprintId"],
         projection: "ALL",
       },
-      LeaseIndex: { keys: ["leaseId", "pk"], projection: "ALL" },
-      GroupIndex: { keys: ["groupId"], projection: "KEYS_ONLY" },
+      LeaseIndex: {
+        table: "principal",
+        keys: ["leaseId", "pk"],
+        projection: "ALL",
+      },
+      GroupIndex: {
+        table: "principal",
+        keys: ["groupId"],
+        projection: "KEYS_ONLY",
+      },
     });
   });
 
@@ -100,6 +127,16 @@ describe("LocalDataStack", () => {
   it("keys the sandbox account table by awsAccountId alone", () => {
     template.hasResourceProperties("AWS::DynamoDB::Table", {
       KeySchema: [{ AttributeName: "awsAccountId", KeyType: "HASH" }],
+    });
+  });
+
+  // The only table whose partition key no other assertion names: `pk`/`sk` and
+  // `userEmail`/`uuid` filters both skip it, so a rename here went unnoticed.
+  // Asserted as an exact single-entry KeySchema, which also pins the absence of
+  // a sort key — a stray `sortKey` would make the array two entries long.
+  it("keys the lease template table by uuid alone", () => {
+    template.hasResourceProperties("AWS::DynamoDB::Table", {
+      KeySchema: [{ AttributeName: "uuid", KeyType: "HASH" }],
     });
   });
 
