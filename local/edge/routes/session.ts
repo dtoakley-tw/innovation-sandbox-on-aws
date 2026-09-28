@@ -2,7 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 import type { ServerResponse } from "node:http";
 
-import type { LocalIsbRole } from "../../shared/names.js";
+import {
+  LOCAL_IDC_PRINCIPAL_ID,
+  type LocalIsbRole,
+} from "../../shared/names.js";
 import type { KeyPair } from "../jwks.js";
 import { mintLocalIdToken } from "../mint-token.js";
 
@@ -13,9 +16,13 @@ import { mintLocalIdToken } from "../mint-token.js";
  * what gets signed. `satisfies` ties the role to the production enum, so a
  * rename there is a compile error here rather than a 403 that reads like an
  * RBAC bug.
+ *
+ * `sub` is `LOCAL_IDC_PRINCIPAL_ID` rather than a readable handle because
+ * `mintLocalIdToken` copies it into `custom:idc_user_id`, which the API parses
+ * as an IDC principal id; the seed keys the admin principal on the same value.
  */
 const LOCAL_USER = {
-  sub: "local-admin",
+  sub: LOCAL_IDC_PRINCIPAL_ID,
   email: "admin@example.local",
   roles: ["Admin"] satisfies readonly LocalIsbRole[],
 };

@@ -1,12 +1,14 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 import { NAMESPACE_PATTERN } from "@amzn/innovation-sandbox-commons/types/isb-types.js";
+import { IdcPrincipalIdSchema } from "@amzn/innovation-sandbox-shared/types/principal.js";
 import { IsbRoleSchema } from "@amzn/innovation-sandbox-shared/utils/auth-utils.js";
 import { describe, expect, it } from "vitest";
 
 import {
   LOCAL_ACCOUNT_ID,
   LOCAL_EDGE_PORT,
+  LOCAL_IDC_PRINCIPAL_ID,
   LOCAL_NAMESPACE,
   LOCAL_REGION,
   LOCAL_ROLE_NAMES,
@@ -30,6 +32,22 @@ describe("local shared names", () => {
   // type. This is the only thing keeping the two lists in step.
   it("mirrors the production IsbRole enum exactly", () => {
     expect([...LOCAL_ROLE_NAMES]).toEqual([...IsbRoleSchema.options]);
+  });
+
+  // The local identity's `sub` is this value, and `mintLocalIdToken` copies it
+  // into `custom:idc_user_id`. Anything that is not a UUID is a 400 from the
+  // leases API, which parses that claim before it looks at roles.
+  it("gives the local identity a sub the API accepts as an IDC principal", () => {
+    expect(IdcPrincipalIdSchema.safeParse(LOCAL_IDC_PRINCIPAL_ID).success).toBe(
+      true,
+    );
+  });
+
+  // Pinned rather than generated, so the signed-in user still matches the seeded
+  // admin principal after a restart. A change here is only safe alongside the
+  // seed's, which `fixtures.test.ts` holds in step.
+  it("pins the local principal id so it survives a restart", () => {
+    expect(LOCAL_IDC_PRINCIPAL_ID).toBe("0aaa0000-0000-4000-8000-000000000001");
   });
 });
 

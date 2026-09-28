@@ -28,7 +28,11 @@ import {
   IdcPrincipalSchema,
 } from "@amzn/innovation-sandbox-shared/types/principal.js";
 
-import { LOCAL_ACCOUNT_ID, LOCAL_REGION } from "../shared/names.js";
+import {
+  LOCAL_ACCOUNT_ID,
+  LOCAL_IDC_PRINCIPAL_ID,
+  LOCAL_REGION,
+} from "../shared/names.js";
 
 /**
  * The fixture data a developer sees on the first `local:up`.
@@ -90,20 +94,20 @@ export interface SeedFixtures {
  * and `local/edge/mint-token.ts` signs locally. What the seed contributes is
  * the principal a lease can be shared with.
  *
- * The ids are UUIDs because `IdcPrincipalIdSchema` requires one, and the local
- * edge's `sub` of `local-admin` does not satisfy it. That is a live defect in
- * the local identity, not a quirk of this fixture: `custom:idc_user_id` reaches
- * the API as the caller's own id, and any flow that validates it against
- * `IdcPrincipalIdSchema` rejects it with a 400 before the role gate runs — see
+ * The admin's `principalId` is `LOCAL_IDC_PRINCIPAL_ID` — the very value
+ * `local/edge/routes/session.ts` signs in as, which the local edge also mints
+ * into `custom:idc_user_id`. Sharing the constant is the point: the API
+ * validates that claim with `IdcPrincipalIdSchema` before its role gate (see
  * `listSharedLeases` in
- * `source/lambdas/api/leases/src/smithy/lease-operations.ts:789` and
- * `getGroupMembershipCache` at `:311`. Seeding a matching id here would not
- * help; the token is the thing that has to change, and that is not this
- * module's to fix.
+ * `source/lambdas/api/leases/src/smithy/lease-operations.ts:789`), and the
+ * shared-leases and group-membership lookups then key on the id, so a
+ * principal seeded under any other id is one the signed-in user cannot be.
+ * The other two ids are personas the local edge never signs in as, so they are
+ * literal here.
  */
 const PRINCIPALS = [
   {
-    principalId: "0aaa0000-0000-4000-8000-000000000001",
+    principalId: LOCAL_IDC_PRINCIPAL_ID,
     displayName: "Local Admin",
     email: ADMIN_EMAIL,
   },

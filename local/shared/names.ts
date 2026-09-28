@@ -19,6 +19,28 @@ export const LOCAL_APP_CLIENT_ID = "localdevclientid";
 export const LOCAL_STAGE = "local";
 export const LOCAL_EDGE_PORT = 4599;
 
+/**
+ * The `sub` of the single local identity, and therefore its
+ * `custom:idc_user_id` claim — `local/edge/mint-token.ts` sets both from one
+ * value. It doubles as the `principalId` of the admin principal the seed
+ * writes, so a request keyed on the signed-in user's own id finds that record;
+ * `fixtures.test.ts` pins the two sides together.
+ *
+ * It is a UUID because it is an IDC principal id, not a nickname:
+ * `IdcPrincipalIdSchema` requires one, and the leases API validates
+ * `custom:idc_user_id` against it in `listSharedLeases`
+ * (`source/lambdas/api/leases/src/smithy/lease-operations.ts:789`) *before* the
+ * role gate, so any other shape is a 400 on the shared-leases query the leases
+ * home page issues, and on `getGroupMembershipCache` at `:309`. Being the local
+ * Admin does not reach past that check.
+ *
+ * Pinned rather than generated, for the same reason every other name here is:
+ * the value has to be byte-identical across restarts, or a developer would sign
+ * in as a principal the seeded records know nothing about. It matches the `0aaa`
+ * family the seed's other principal ids are drawn from.
+ */
+export const LOCAL_IDC_PRINCIPAL_ID = "0aaa0000-0000-4000-8000-000000000001";
+
 /** The seven tables `IsbDataResources` creates, in its declaration order. */
 export const LOCAL_TABLE_NAMES = [
   "sandboxAccount",

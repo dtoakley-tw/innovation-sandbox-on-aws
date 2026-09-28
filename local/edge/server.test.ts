@@ -1,5 +1,6 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
+import { IdcPrincipalIdSchema } from "@amzn/innovation-sandbox-shared/types/principal.js";
 import { mkdtempSync, rmSync } from "node:fs";
 import {
   createServer,
@@ -24,6 +25,7 @@ import {
 
 import {
   LOCAL_EDGE_PORT,
+  LOCAL_IDC_PRINCIPAL_ID,
   LOCAL_STAGE,
   localEdgeConfig,
 } from "../shared/names.js";
@@ -279,6 +281,24 @@ describe("the local edge", () => {
       token_use: "id",
       "custom:isb_roles": '["Admin"]',
     });
+  });
+
+  // `custom:idc_user_id` is read as the caller's own id by CognitoAuthService
+  // and the leases API parses it with `IdcPrincipalIdSchema` *before* its role
+  // gate, so a `sub` that is not a UUID is a 400 on the shared-leases query the
+  // home page issues — being Admin does not reach past it. The shared-leases
+  // and group-membership lookups then key on this id, so it has to be the one
+  // the seed writes the admin principal under, not merely a well-formed UUID.
+  it("signs the session with the id the seed keys the admin principal on", async () => {
+    const response = await fetch(`${base}/session`);
+    const session = (await response.json()) as {
+      payload: Record<string, unknown>;
+    };
+    expect(IdcPrincipalIdSchema.safeParse(session.payload.sub).success).toBe(
+      true,
+    );
+    expect(session.payload.sub).toBe(LOCAL_IDC_PRINCIPAL_ID);
+    expect(session.payload["custom:idc_user_id"]).toBe(LOCAL_IDC_PRINCIPAL_ID);
   });
 
   it("publishes a JWKS holding only public key material", async () => {

@@ -23,7 +23,8 @@ import {
 } from "@amzn/innovation-sandbox-shared/types/lease.js";
 import { IdcPrincipalSchema } from "@amzn/innovation-sandbox-shared/types/principal.js";
 
-import { buildSeedFixtures } from "./fixtures.js";
+import { LOCAL_IDC_PRINCIPAL_ID } from "../shared/names.js";
+import { ADMIN_EMAIL, buildSeedFixtures } from "./fixtures.js";
 
 /**
  * The branch of `LeaseSchema` a lease's `status` selects. Building a value from
@@ -216,5 +217,24 @@ describe("seed fixtures", () => {
     expect(
       fixtures.leases.filter((lease) => lease.userEmail === owner),
     ).toHaveLength(fixtures.leases.length);
+  });
+
+  // The email alone is not the join. The edge mints `custom:idc_user_id` from
+  // its own `sub`, the shared-leases and group-membership lookups key on that
+  // id, and the API rejects it with a 400 unless it parses as an IDC principal
+  // id — so the seeded admin has to be reachable by the id the token carries.
+  it("seeds the admin principal under the id the local edge signs in as", () => {
+    const admin = fixtures.principals.find(
+      (principal) => principal.email === ADMIN_EMAIL,
+    );
+    expect(admin).toBeDefined();
+    expect(admin?.principalId).toBe(LOCAL_IDC_PRINCIPAL_ID);
+  });
+
+  // The other two personas are never signed in as, so a collision with the local
+  // identity's id would make one principal two people.
+  it("keeps every seeded principal id distinct", () => {
+    const ids = fixtures.principals.map((principal) => principal.principalId);
+    expect(new Set(ids).size).toBe(ids.length);
   });
 });
