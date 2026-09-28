@@ -20,6 +20,20 @@ export const LOCAL_STAGE = "local";
 export const LOCAL_EDGE_PORT = 4599;
 
 /**
+ * LocalStack as seen from *inside* the `isb-local` Docker network — by the
+ * Lambdas it starts, and by the local edge. The service name, never
+ * `localhost`: a Lambda and the edge are each their own container, so on that
+ * network `localhost` means themselves and the published port is not there.
+ *
+ * Distinct from `LOCALSTACK_ENDPOINT` in
+ * `local/infrastructure/lib/lambda-environment.ts`, which is the same service
+ * as the *host* reaches it, for the CDK CLI. Both name one service, so both
+ * constants live here: a second copy of either would be a profile whose
+ * components disagree about where LocalStack is.
+ */
+export const LOCALSTACK_INTERNAL_ENDPOINT = "http://localstack:4566";
+
+/**
  * The `sub` of the single local identity, and therefore its
  * `custom:idc_user_id` claim — `local/edge/mint-token.ts` sets both from one
  * value. It doubles as the `principalId` of the admin principal the seed

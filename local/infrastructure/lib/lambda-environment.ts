@@ -9,6 +9,7 @@ import {
   LOCAL_REGION,
   LOCAL_USER_POOL_ID,
   localResourceNames,
+  LOCALSTACK_INTERNAL_ENDPOINT,
   localTableNames,
 } from "../../shared/names.js";
 
@@ -31,7 +32,7 @@ const commonEnv: Record<string, string> = {
   AWS_SECRET_ACCESS_KEY: "test",
   // Redirects every AWS SDK v3 client to LocalStack without any code change:
   // the SDKs resolve this from process.env during client construction.
-  AWS_ENDPOINT_URL: "http://localstack:4566",
+  AWS_ENDPOINT_URL: LOCALSTACK_INTERNAL_ENDPOINT,
   COGNITO_USER_POOL_ID: LOCAL_USER_POOL_ID,
   COGNITO_APP_CLIENT_ID: LOCAL_APP_CLIENT_ID,
   ISB_NAMESPACE: LOCAL_NAMESPACE,
@@ -56,6 +57,43 @@ const commonEnv: Record<string, string> = {
   HUB_ACCOUNT_ID: localResourceNames.hubAccountId,
   AWS_ACCESS_PORTAL_URL: `http://localhost:${LOCAL_EDGE_PORT}/local/unsupported/access-portal`,
 };
+
+/**
+ * Variables the Lambda runtime sets itself, and which a function may therefore
+ * not be *configured* with: CDK refuses to synthesize a function whose
+ * environment names one of these
+ * (https://docs.aws.amazon.com/lambda/latest/dg/configuration-envvars.html,
+ * enforced by `Function.addEnvironment`).
+ *
+ * Restated in full rather than filtered down to what `commonEnv` happens to set
+ * today, so the filter stays correct if a variable is added: a stale *extra*
+ * entry is inert, a stale *short* list is an undeployable stack.
+ *
+ * They are declared in `commonEnv` above because what a Lambda sees at runtime
+ * is what this function assembles, and the runtime supplies the same values — so
+ * the environment the schema is validated against is complete, and the one
+ * handed to CDK is deployable.
+ */
+const RUNTIME_RESERVED = [
+  "_HANDLER",
+  "_X_AMZN_TRACE_ID",
+  "AWS_ACCESS_KEY",
+  "AWS_ACCESS_KEY_ID",
+  "AWS_DEFAULT_REGION",
+  "AWS_EXECUTION_ENV",
+  "AWS_LAMBDA_FUNCTION_MEMORY_SIZE",
+  "AWS_LAMBDA_FUNCTION_NAME",
+  "AWS_LAMBDA_FUNCTION_VERSION",
+  "AWS_LAMBDA_INITIALIZATION_TYPE",
+  "AWS_LAMBDA_LOG_GROUP_NAME",
+  "AWS_LAMBDA_LOG_STREAM_NAME",
+  "AWS_LAMBDA_RUNTIME_API",
+  "AWS_REGION",
+  "AWS_SECRET_ACCESS_KEY",
+  "AWS_SESSION_TOKEN",
+  "LAMBDA_RUNTIME_DIR",
+  "LAMBDA_TASK_ROOT",
+] as const;
 
 /**
  * Assembles a Lambda environment and validates it with the domain's own
@@ -87,6 +125,11 @@ export function buildLocalEnv(
   // schema describes — AWS_ENDPOINT_URL, POWERTOOLS_TRACE_ENABLED — are exactly
   // the ones the AWS SDK and Powertools read from `process.env`. Projecting
   // through Zod would silently drop the redirection to LocalStack.
+  //
+  // Validated first, stripped second, so a schema that ever came to require a
+  // reserved name fails here as a named field rather than reaching CDK, which
+  // reports the same problem without saying which domain or variable led to it.
+  for (const reserved of RUNTIME_RESERVED) delete merged[reserved];
   return merged;
 }
 
