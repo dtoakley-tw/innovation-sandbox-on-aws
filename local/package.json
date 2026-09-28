@@ -5,7 +5,8 @@
   "description": "Local-only development tooling (not part of the deployed distribution)",
   "type": "module",
   "scripts": {
-    "test": "vitest run"
+    "test": "vitest run",
+    "seed": "tsx seed/seed.ts"
   },
   "devDependencies": {
     "zod": "^4.1.12"
