@@ -6,7 +6,9 @@
   "type": "module",
   "scripts": {
     "test": "vitest run",
-    "seed": "tsx seed/seed.ts"
+    "seed": "tsx seed/seed.ts",
+    "verify": "tsx verify/verify.ts",
+    "smoke": "tsx e2e/smoke.ts"
   },
   "devDependencies": {
     "zod": "^4.1.12"
