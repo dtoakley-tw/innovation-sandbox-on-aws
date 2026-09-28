@@ -1,0 +1,51 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Local development only. Not part of the deployed distribution.
+services:
+  localstack:
+    image: localstack/localstack:4
+    ports:
+      - "4566:4566"
+    environment:
+      # Free tier. No SERVICES list so every available service is loaded.
+      DEBUG: "0"
+      LAMBDA_RUNTIME_ENVIRONMENT_TIMEOUT: "60"
+      # A marker so this container is identifiable as the local one in
+      # `docker ps`. Nothing reads it; being on this compose network, not this
+      # variable, is what lets the Lambda containers reach the edge by name.
+      ISB_LOCAL: "1"
+    # Deliberately no volumes: `local:reset` recreates the containers, which
+    # is unambiguous in a way that selectively deleting tables is not.
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4566/_localstack/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  isb-local-edge:
+    image: node:24-alpine
+    working_dir: /workspace
+    command: sh -c "corepack enable && npm install --no-audit --no-fund && npx tsx local/edge/server.ts"
+    ports:
+      # The browser's route in. 4599 mirrors LOCAL_EDGE_PORT in
+      # local/shared/names.ts, which the shell and the Vite proxy also use.
+      - "4599:4599"
+    environment:
+      # `localstack`, not `localhost`: the Lambdas this forwards to run as
+      # containers on this network, and inside a container localhost is the
+      # Lambdas' own. The same process is published on the host port above for
+      # the browser — the two addresses are not an inconsistency.
+      #
+      # `restapis/0` is a placeholder. The real id only exists once
+      # `cdk deploy` has run, so `local-up.sh` recreates this service with it,
+      # or fails rather than leaving the placeholder serving.
+      ISB_LOCAL_API_GATEWAY_INVOKE_URL: "http://localstack:4566/restapis/0/local/_user_request_"
+      ISB_LOCAL_KEY_DIR: "/workspace/local/.keys"
+    volumes:
+      # The repository, so the edge runs the working tree rather than a copy
+      # that has to be rebuilt after every edit.
+      - ..:/workspace
+    depends_on:
+      localstack:
+        condition: service_healthy
