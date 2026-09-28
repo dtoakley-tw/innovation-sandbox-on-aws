@@ -41,7 +41,9 @@ waitForLocalStack() {
 waitForLocalEdge() {
   # Six minutes rather than two: on a cold image the edge container installs the
   # workspace's dependencies before it listens, which takes longer than
-  # LocalStack ever does. The deploy above overlaps most of that wait.
+  # LocalStack ever does. The deploy above overlaps most of that wait. An
+  # estimate, not a measurement — nothing has timed this yet, and the message on
+  # expiry names the URL, so raising it is the fix if it is too short.
   waitFor "http://localhost:4599/healthz" 180
 }
 
@@ -73,11 +75,10 @@ if [ ! -f "$outputs_file" ]; then
   exit 1
 fi
 # `cdk deploy --outputs-file` nests the outputs under the stack name — the CLI
-# writes `{ "<StackName>": { "<OutputName>": "value" } }` — so the id is read out
-# of whichever stack object carries it, and is empty when none does, which is
-# what the guard below tests for. Read off the top level, as though the file
-# were flat, it would be undefined on every deploy, and the edge would be
-# pointed at an API Gateway that does not exist.
+# writes `{ "<StackName>": { "<OutputName>": "value" } }` — so each value is read
+# out of whichever stack object carries it, and is empty when none does, which
+# is what the guards below test for. Read off the top level, as though the file
+# were flat, they would be undefined on every deploy.
 api_id="$(node -e 'const o=require("./local/cdk.out/local-outputs.json");const ids=Object.values(o).map(s=>s?.ApiGatewayRestApiId).filter(Boolean);process.stdout.write(ids[0]??"")')" || {
   echo "could not read ApiGatewayRestApiId from $outputs_file" >&2
   exit 1
@@ -87,9 +88,35 @@ if [ -z "$api_id" ]; then
   exit 1
 fi
 
+# The URL, not the id, because the stack builds it. Assembling
+# `http://localstack:4566/restapis/$api_id/local/_user_request_` here would be
+# a second place the URL's shape is decided, and the two could disagree.
+invoke_url="$(node -e 'const o=require("./local/cdk.out/local-outputs.json");const urls=Object.values(o).map(s=>s?.ApiGatewayInvokeUrl).filter(Boolean);process.stdout.write(urls[0]??"")')" || {
+  echo "could not read ApiGatewayInvokeUrl from $outputs_file" >&2
+  exit 1
+}
+if [ -z "$invoke_url" ]; then
+  echo "no ApiGatewayInvokeUrl in $outputs_file; the edge cannot reach the API Gateway" >&2
+  exit 1
+fi
+
+# Compose renders this into the edge container's environment as it recreates the
+# service, so exporting it is what makes the recreate mean anything. Without the
+# export the container restarts with the same placeholder, /healthz answers 200,
+# and every /api request 404s — a failure none of the checks below would see.
+export ISB_LOCAL_API_GATEWAY_INVOKE_URL="$invoke_url"
 echo "==> restarting the local edge with API Gateway id $api_id"
 docker compose -f local/compose.yaml up -d --force-recreate isb-local-edge
 waitForLocalEdge
+
+# Asked rather than assumed: interpolation that silently does not fire, or a
+# container that kept its old environment, both leave a healthy edge serving the
+# placeholder behind a green run.
+container_url="$(docker compose -f local/compose.yaml exec -T isb-local-edge printenv ISB_LOCAL_API_GATEWAY_INVOKE_URL)"
+if [ "$container_url" != "$invoke_url" ]; then
+  echo "the edge container has ISB_LOCAL_API_GATEWAY_INVOKE_URL='$container_url', not '$invoke_url'" >&2
+  exit 1
+fi
 
 echo "==> seeding fixtures"
 npm run local:seed

@@ -13,10 +13,6 @@ services:
       # Free tier. No SERVICES list so every available service is loaded.
       DEBUG: "0"
       LAMBDA_RUNTIME_ENVIRONMENT_TIMEOUT: "60"
-      # A marker so this container is identifiable as the local one in
-      # `docker ps`. Nothing reads it; being on the isb-local network, not this
-      # variable, is what lets the Lambda containers reach the edge by name.
-      ISB_LOCAL: "1"
       # The network LocalStack attaches the Lambda containers it starts to.
       # They have to resolve `isb-local-edge` (the JWKS fetch on every cold
       # start) and `localstack` (every AWS SDK call, via AWS_ENDPOINT_URL) by
@@ -46,8 +42,6 @@ services:
       # local/shared/names.ts, which the shell and the Vite proxy also use.
       - "4599:4599"
     networks:
-      # The same network the Lambda containers join, so a Lambda fetching the
-      # JWKS reaches the edge by service name rather than by localhost.
       - isb-local
     environment:
       # `localstack`, not `localhost`: the Lambdas this forwards to run as
@@ -55,10 +49,11 @@ services:
       # the Lambdas' own. The same process is published on the host port above
       # for the browser — the two addresses are not an inconsistency.
       #
-      # `restapis/0` is a placeholder. The real id only exists once
-      # `cdk deploy` has run, so `local-up.sh` recreates this service with it,
-      # or fails rather than leaving the placeholder serving.
-      ISB_LOCAL_API_GATEWAY_INVOKE_URL: "http://localstack:4566/restapis/0/local/_user_request_"
+      # The `${...}` is how the real id gets here: `local-up.sh` exports the
+      # invoke URL from the stack output before it recreates this service, and
+      # checks afterwards that the container has it. The `:-` default is the
+      # placeholder `restapis/0`, so a bare `docker compose up` still starts.
+      ISB_LOCAL_API_GATEWAY_INVOKE_URL: "${ISB_LOCAL_API_GATEWAY_INVOKE_URL:-http://localstack:4566/restapis/0/local/_user_request_}"
       ISB_LOCAL_KEY_DIR: "/workspace/local/.keys"
     volumes:
       # The repository, so the edge runs the working tree rather than a copy
@@ -68,13 +63,11 @@ services:
       localstack:
         condition: service_healthy
 
-# Declared explicitly rather than left to the compose default, because Docker
-# attaches the Lambda containers to a network by name and the only place
-# LocalStack learns that name is the environment variable above. The explicit
-# `name` is what keeps the two in step: without it compose prefixes the project
-# directory onto the key, so the network would be `local_isb-local` in a
-# checkout of this directory and something else in a checkout of any other. The
-# name is project-specific so two profiles on one machine cannot collide.
+# The `name:` is load-bearing: without it compose prefixes the project directory
+# onto the key, so the network would be `local_isb-local` in a checkout of this
+# directory and something else in a checkout of any other — and the only place
+# LocalStack learns the name is the variable above. Project-specific, so two
+# profiles on one machine cannot collide.
 networks:
   isb-local:
     name: isb-local

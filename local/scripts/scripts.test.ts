@@ -19,7 +19,7 @@ import {
   LOCAL_JWKS_URI,
   LOCALSTACK_ENDPOINT,
 } from "../infrastructure/lib/lambda-environment.js";
-import { LOCAL_EDGE_PORT, LOCAL_REGION } from "../shared/names.js";
+import { LOCAL_EDGE_PORT, LOCAL_REGION, LOCAL_STAGE } from "../shared/names.js";
 
 const localDir = join(dirname(fileURLToPath(import.meta.url)), "..");
 const repoRoot = join(localDir, "..");
@@ -73,25 +73,49 @@ const serviceNetworks = (name: string): string[] =>
   composeList(name, "networks");
 
 /**
+ * The `node -e` expression the up script uses to read one named output out of
+ * the CDK outputs file, found by the output it asks for. There is one per value
+ * the script needs, and each is a standalone program a test can run.
+ */
+const outputsRead = (outputName: string): string => {
+  const expression = read("scripts/local-up.sh").match(
+    new RegExp(`node -e '([^']*${outputName}[^']*)'`),
+  )?.[1];
+  if (expression === undefined) {
+    throw new Error(`no node -e read of ${outputName} in local-up.sh`);
+  }
+  return expression;
+};
+
+/**
  * The entries of a compose list key — `networks:`, `volumes:` — inside one
  * service. Comment lines between the key and its entries belong to the block, so
  * they are walked rather than mistaken for the end of it, and a following key is
  * not one of them because it is neither a comment nor a `- ` entry.
  */
-const composeList = (service: string, key: string): string[] =>
-  composeService(service)
+const composeList = (service: string, key: string): string[] => {
+  const entries = composeService(service)
     .match(new RegExp(`^ {4}${key}:\\n((?: {4,}(?:#.*|- .+)\\n?)+)`, "m"))?.[1]
-    ?.match(/^ {4,}- (\S+)/gm)
-    ?.map((entry) => entry.replace(/^ *- /, "")) ?? [];
+    ?.match(/^ {4,}- (\S+)/gm);
+  if (entries === undefined) {
+    throw new Error(`no ${key} list on the ${service} service`);
+  }
+  return entries.map((entry) => entry.replace(/^ *- /, ""));
+};
 
 /** The real Docker network name a top-level network is created with. */
-const declaredNetworkName = (key: string): string | undefined =>
-  read("compose.yaml").match(
+const declaredNetworkName = (key: string): string => {
+  const name = read("compose.yaml").match(
     new RegExp(
       `^ {2}${key}:\\n(?: {4}.+\\n)*? {4}name:\\s*"?([^"\\n]+)"?`,
       "m",
     ),
   )?.[1];
+  if (name === undefined) {
+    throw new Error(`no top-level network named ${key}`);
+  }
+  return name;
+};
 
 describe("local compose profile", () => {
   it("declares LocalStack and the edge service the Lambdas address", () => {
@@ -156,17 +180,27 @@ describe("local compose profile", () => {
   });
 
   // Two addresses for one process, and getting this wrong breaks every Lambda
-  // request while leaving the browser working — so it is pinned both ways.
-  it("points the edge at LocalStack in-network, and not at the host port", () => {
-    const invokeUrl = read("compose.yaml").match(
-      /ISB_LOCAL_API_GATEWAY_INVOKE_URL: "([^"]+)"/,
-    )?.[1];
-    expect(invokeUrl).toBeDefined();
-    expect(new URL(invokeUrl as string).hostname).toBe("localstack");
-    expect(invokeUrl).not.toContain("localhost");
-    // A placeholder id: the real one does not exist until `cdk deploy` runs in
-    // local-up.sh, which recreates the edge with it or fails.
-    expect(invokeUrl).toContain("/restapis/0/");
+  // request while leaving the browser working — so the placeholder the compose
+  // file falls back to is pinned both ways, along with the variable the real
+  // value arrives through.
+  it("interpolates the invoke URL, defaulting to an in-network placeholder", () => {
+    const interpolated = read("compose.yaml").match(
+      /ISB_LOCAL_API_GATEWAY_INVOKE_URL:\s*"\$\{([A-Z_]+):-([^}]+)\}"/,
+    );
+    expect(interpolated?.[1]).toBe("ISB_LOCAL_API_GATEWAY_INVOKE_URL");
+    const placeholder = new URL(interpolated?.[2] as string);
+    // In-network: the browser never sees this, only the Lambdas do. The host is
+    // the LocalStack service the first test proves this file declares, and the
+    // port the one constant that does describe this endpoint from the host side,
+    // `LOCALSTACK_ENDPOINT` — which also says "not localhost".
+    expect(placeholder.hostname).toBe("localstack");
+    expect(placeholder.port).toBe(new URL(LOCALSTACK_ENDPOINT).port);
+    expect(interpolated?.[2]).not.toContain("localhost");
+    // A placeholder id, and the stage Task 12's stack names. Either changing
+    // means the two sides disagree about the URL shape, which only shows up as
+    // a 404 from a Lambda call.
+    expect(placeholder.pathname).toContain("/restapis/0/");
+    expect(placeholder.pathname).toContain(`/${LOCAL_STAGE}/_user_request_`);
   });
 });
 
@@ -184,7 +218,7 @@ describe("local scripts", () => {
     }
   });
 
-  it("are executable, and open with a shebang, a comment, and strict mode", () => {
+  it("are executable, and open with a shebang, the licence, and strict mode", () => {
     for (const name of SCRIPT_NAMES) {
       const path = join(localDir, "scripts", name);
       // `npm run local:*` shells out with `bash`, so the bit is about a
@@ -195,8 +229,12 @@ describe("local scripts", () => {
       ).toBeGreaterThan(0);
       const body = readFileSync(path, "utf-8");
       expect(body.startsWith("#!/usr/bin/env bash\n")).toBe(true);
-      expect(body.slice(0, body.indexOf("set -euo pipefail"))).toMatch(
-        /^# .+$/m,
+      // The pre-commit `insert-license` hook matches `ts|js|tsx|jsx|scss`, so
+      // these four files get no licence check anywhere else. The header is
+      // asserted by content rather than by "there is a comment here", which any
+      // line satisfied.
+      expect(body).toContain(
+        "# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: Apache-2.0\n",
       );
       expect(body).toContain("set -euo pipefail");
     }
@@ -329,68 +367,135 @@ exit $status`,
     );
   });
 
-  it("restarts the edge with the deployed API Gateway id", () => {
+  it("restarts the edge only after the id is known", () => {
     const up = read("scripts/local-up.sh");
     expect(up).toContain("local/cdk.out/local-outputs.json");
     expect(up).toMatch(
       /docker compose [^\n]*up -d --force-recreate isb-local-edge/,
     );
-    // Recreated only after the id is known, so the edge never serves the
-    // placeholder for longer than the deploy takes.
-    expect(up.indexOf("api_id=")).toBeLessThan(
-      up.indexOf("--force-recreate isb-local-edge"),
-    );
-    expect(up.indexOf("exit 1")).toBeLessThan(
-      up.indexOf("--force-recreate isb-local-edge"),
-    );
+    // Anchored to the guards themselves. This used to assert
+    // `indexOf("exit 1") < indexOf("--force-recreate")`, which resolved to the
+    // cdk deploy guard three statements earlier, stayed green with the id
+    // guard deleted, and carried a comment claiming otherwise.
+    for (const guard of [
+      'if [ -z "$api_id" ]; then',
+      'if [ -z "$invoke_url" ]; then',
+    ]) {
+      expect(up).toContain(guard);
+      expect(up.indexOf(guard)).toBeLessThan(
+        up.indexOf("--force-recreate isb-local-edge"),
+      );
+    }
   });
 
-  it("aborts rather than leaving the placeholder id in place", () => {
+  // The id does nothing until it crosses a process boundary: compose reads it
+  // from the environment when it renders the file, and the container only gets
+  // what compose hands it. A `--force-recreate` with no export re-renders the
+  // same placeholder and restarts the edge against an API that does not exist —
+  // which is invisible until a request 404s, not until the script fails.
+  // Both ends are cross-checked against each other, never against a literal.
+  it("exports the invoke URL for the recreate that needs it", () => {
+    const compose = read("compose.yaml");
+    const name = compose.match(
+      /ISB_LOCAL_API_GATEWAY_INVOKE_URL:\s*"\$\{([A-Z_]+):-/,
+    )?.[1];
+    expect(name).toBe("ISB_LOCAL_API_GATEWAY_INVOKE_URL");
+    const up = read("scripts/local-up.sh");
+    const exported = up.match(new RegExp(`export ${name}="\\$([a-z_]+)"`))?.[1];
+    expect(exported).toBeDefined();
+    // Before the recreate, which is the only step that re-renders the
+    // container's environment.
+    expect(up.indexOf(`export ${name}=`)).toBeLessThan(
+      up.indexOf("--force-recreate isb-local-edge"),
+    );
+    // What is exported is the variable the guard already proved non-empty, and
+    // that variable is the stack output verbatim — not a URL assembled in bash,
+    // which is how the two could end up disagreeing about its shape.
+    expect(up).toContain(`if [ -z "$${exported}" ]; then`);
+    expect(up).toMatch(new RegExp(`^${exported}="\\$\\(node -e '`, "m"));
+    expect(outputsRead("ApiGatewayInvokeUrl")).toContain("ApiGatewayInvokeUrl");
+  });
+
+  // Compose substituting a variable is not the same as the value arriving: a
+  // renamed service or a malformed interpolation renders the placeholder again,
+  // silently. So the container is asked what it actually has, before anything
+  // downstream depends on the answer.
+  it("asks the edge container what it received, before seeding", () => {
+    const up = read("scripts/local-up.sh");
+    expect(up).toContain(
+      "exec -T isb-local-edge printenv ISB_LOCAL_API_GATEWAY_INVOKE_URL",
+    );
+    expect(up.indexOf("printenv")).toBeGreaterThan(
+      up.indexOf("--force-recreate isb-local-edge"),
+    );
+    expect(up.indexOf("printenv")).toBeLessThan(
+      up.indexOf("npm run local:seed"),
+    );
+    // Compared against the same value that was exported, not a re-derivation.
+    expect(up).toMatch(/if \[ "\$container_url" != "\$invoke_url" \]; then/);
+  });
+
+  it("aborts rather than leaving the placeholder in place", () => {
     const up = read("scripts/local-up.sh");
     expect(up).toMatch(/if \[ ! -f "\$[a-z_]+" \]; then/);
-    expect(up).toMatch(/if \[ -z "\$api_id" \]; then/);
+    for (const value of ["api_id", "invoke_url"]) {
+      expect(up).toContain(`if [ -z "$${value}" ]; then`);
+    }
   });
 
-  // The text assertions above cannot tell an expression that finds the id from
-  // one that looks in the wrong place and finds nothing, so the expression is
+  // The text assertions above cannot tell an expression that finds the value
+  // from one that looks in the wrong place and finds nothing, so each is
   // executed here, in a temp directory, against the shape the CDK CLI actually
   // writes: outputs nested under the stack name
   // (`node_modules/aws-cdk/lib/index.js`, `stackOutputs[stack.stackName] = ...`).
-  it("reads the API Gateway id out of the nested outputs, or reads nothing", () => {
-    const expression = read("scripts/local-up.sh").match(
-      /node -e '([^']+)'/,
-    )?.[1];
-    expect(expression).toBeDefined();
-    const runWith = (outputs: unknown): string => {
+  it("reads the id and the invoke URL out of the nested outputs, or nothing", () => {
+    const readId = outputsRead("ApiGatewayRestApiId");
+    const readUrl = outputsRead("ApiGatewayInvokeUrl");
+    const runWith = (expression: string, outputs: unknown): string => {
       const dir = mkdtempSync(join(tmpdir(), "isb-local-outputs-"));
       mkdirSync(join(dir, "local", "cdk.out"), { recursive: true });
       writeFileSync(
         join(dir, "local", "cdk.out", "local-outputs.json"),
         JSON.stringify(outputs),
       );
-      return execFileSync("node", ["-e", expression as string], {
+      return execFileSync("node", ["-e", expression], {
         cwd: dir,
         encoding: "utf-8",
       });
     };
-    expect(
-      runWith({ IsbLocalCompute: { ApiGatewayRestApiId: "abc123" } }),
-    ).toBe("abc123");
-    // Whichever stack carries the output, so the app is not tied to a stack
+    const DEPLOYED = {
+      IsbLocalCompute: {
+        ApiGatewayRestApiId: "abc123",
+        ApiGatewayInvokeUrl:
+          "http://localstack:4566/restapis/abc123/local/_user_request_",
+      },
+    };
+    expect(runWith(readId, DEPLOYED)).toBe("abc123");
+    expect(runWith(readUrl, DEPLOYED)).toBe(
+      DEPLOYED.IsbLocalCompute.ApiGatewayInvokeUrl,
+    );
+    // Whichever stack carries the outputs, so the app is not tied to a stack
     // name before it exists.
     expect(
-      runWith({
+      runWith(readId, {
         IsbLocalData: { SomeOtherOutput: "1" },
-        IsbLocalCompute: { ApiGatewayRestApiId: "def456" },
+        ...DEPLOYED,
       }),
-    ).toBe("def456");
-    // Nothing to read: the guard's subject must be empty so `[ -z ]` fires
+    ).toBe("abc123");
+    // Nothing to read: the guards' subjects must be empty so `[ -z ]` fires
     // rather than the edge running against a URL that cannot resolve.
-    expect(runWith({})).toBe("");
-    expect(runWith({ IsbLocalCompute: {} })).toBe("");
-    expect(runWith({ IsbLocalCompute: { ApiGatewayRestApiId: null } })).toBe(
-      "",
-    );
+    for (const expression of [readId, readUrl]) {
+      expect(runWith(expression, {})).toBe("");
+      expect(runWith(expression, { IsbLocalCompute: {} })).toBe("");
+      expect(
+        runWith(expression, {
+          IsbLocalCompute: {
+            ApiGatewayRestApiId: null,
+            ApiGatewayInvokeUrl: null,
+          },
+        }),
+      ).toBe("");
+    }
   });
 
   it("seeds only once the edge is healthy", () => {
