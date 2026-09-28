@@ -72,11 +72,13 @@ if [ ! -f "$outputs_file" ]; then
   echo "cdk deploy reported success but wrote no $outputs_file" >&2
   exit 1
 fi
-# `?? ""` so an absent key yields an empty string, which is what the guard
-# below tests for. Without it a missing key reaches `process.stdout.write`,
-# which throws on a non-string — loud, but a Node stack trace rather than the
-# one line that says which output is missing.
-api_id="$(node -e 'const o=require("./local/cdk.out/local-outputs.json");process.stdout.write(o.ApiGatewayRestApiId ?? "")')" || {
+# `cdk deploy --outputs-file` nests the outputs under the stack name — the CLI
+# writes `{ "<StackName>": { "<OutputName>": "value" } }` — so the id is read out
+# of whichever stack object carries it, and is empty when none does, which is
+# what the guard below tests for. Read off the top level, as though the file
+# were flat, it would be undefined on every deploy, and the edge would be
+# pointed at an API Gateway that does not exist.
+api_id="$(node -e 'const o=require("./local/cdk.out/local-outputs.json");const ids=Object.values(o).map(s=>s?.ApiGatewayRestApiId).filter(Boolean);process.stdout.write(ids[0]??"")')" || {
   echo "could not read ApiGatewayRestApiId from $outputs_file" >&2
   exit 1
 }

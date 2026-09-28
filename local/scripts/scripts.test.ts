@@ -279,12 +279,12 @@ exit $status`,
     expect(up).toMatch(/if \[ -z "\$api_id" \]; then/);
   });
 
-  // The text assertions above cannot tell an expression that yields the id from
-  // one that throws a Node stack trace, so which is what a missing key gets
-  // through. Both end the script — but only one ends it on the line that names
-  // the missing output. So the expression is executed here, in a temp
-  // directory, against each shape the outputs file can take.
-  it("reads the API Gateway id out of the outputs file, or reads nothing", () => {
+  // The text assertions above cannot tell an expression that finds the id from
+  // one that looks in the wrong place and finds nothing, so the expression is
+  // executed here, in a temp directory, against the shape the CDK CLI actually
+  // writes: outputs nested under the stack name
+  // (`node_modules/aws-cdk/lib/index.js`, `stackOutputs[stack.stackName] = ...`).
+  it("reads the API Gateway id out of the nested outputs, or reads nothing", () => {
     const expression = read("scripts/local-up.sh").match(
       /node -e '([^']+)'/,
     )?.[1];
@@ -301,11 +301,24 @@ exit $status`,
         encoding: "utf-8",
       });
     };
-    expect(runWith({ ApiGatewayRestApiId: "abc123" })).toBe("abc123");
-    // Absent, and empty: both must leave the guard's subject empty so `[ -z ]`
-    // fires. Anything else runs the edge against a URL that cannot resolve.
+    expect(
+      runWith({ IsbLocalCompute: { ApiGatewayRestApiId: "abc123" } }),
+    ).toBe("abc123");
+    // Whichever stack carries the output, so the app is not tied to a stack
+    // name before it exists.
+    expect(
+      runWith({
+        IsbLocalData: { SomeOtherOutput: "1" },
+        IsbLocalCompute: { ApiGatewayRestApiId: "def456" },
+      }),
+    ).toBe("def456");
+    // Nothing to read: the guard's subject must be empty so `[ -z ]` fires
+    // rather than the edge running against a URL that cannot resolve.
     expect(runWith({})).toBe("");
-    expect(runWith({ ApiGatewayRestApiId: null })).toBe("");
+    expect(runWith({ IsbLocalCompute: {} })).toBe("");
+    expect(runWith({ IsbLocalCompute: { ApiGatewayRestApiId: null } })).toBe(
+      "",
+    );
   });
 
   it("seeds only once the edge is healthy", () => {
