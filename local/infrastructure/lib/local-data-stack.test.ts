@@ -25,6 +25,26 @@ beforeAll(() => {
 
 const tables = () => template.findResources("AWS::DynamoDB::Table");
 
+/** Index definitions keyed by name, flattened across the seven tables. */
+const indexes = () =>
+  Object.fromEntries(
+    Object.values(tables()).flatMap((table) =>
+      (table.Properties.GlobalSecondaryIndexes ?? []).map(
+        (gsi: {
+          IndexName: string;
+          KeySchema: { AttributeName: string }[];
+          Projection: { ProjectionType: string };
+        }) => [
+          gsi.IndexName,
+          {
+            keys: gsi.KeySchema.map((key) => key.AttributeName),
+            projection: gsi.Projection.ProjectionType,
+          },
+        ],
+      ),
+    ),
+  );
+
 describe("LocalDataStack", () => {
   it("creates exactly seven tables", () => {
     template.resourceCountIs("AWS::DynamoDB::Table", LOCAL_TABLE_NAMES.length);
@@ -49,21 +69,23 @@ describe("LocalDataStack", () => {
     });
   });
 
-  it("creates the GSIs the production stores query", () => {
-    const indexNames = Object.values(tables()).flatMap((table) =>
-      (table.Properties.GlobalSecondaryIndexes ?? []).map(
-        (gsi: { IndexName: string }) => gsi.IndexName,
-      ),
-    );
-    expect(indexNames).toEqual(
-      expect.arrayContaining([
-        "blueprintId-index",
-        "StatusIndex",
-        "itemType-blueprintId-index",
-        "LeaseIndex",
-        "GroupIndex",
-      ]),
-    );
+  // Pinned exactly, not just "contains these": a GSI dropped, renamed, or
+  // given the wrong sort key synthesizes cleanly and only fails as a query that
+  // quietly returns nothing.
+  it("creates exactly the GSIs the production stores query", () => {
+    expect(indexes()).toEqual({
+      "blueprintId-index": { keys: ["blueprintId"], projection: "KEYS_ONLY" },
+      StatusIndex: {
+        keys: ["status", "originalLeaseTemplateUuid"],
+        projection: "ALL",
+      },
+      "itemType-blueprintId-index": {
+        keys: ["itemType", "blueprintId"],
+        projection: "ALL",
+      },
+      LeaseIndex: { keys: ["leaseId", "pk"], projection: "ALL" },
+      GroupIndex: { keys: ["groupId"], projection: "KEYS_ONLY" },
+    });
   });
 
   it("keys the config table by section/sk as the ConfigStore expects", () => {
@@ -108,10 +130,10 @@ describe("LocalDataStack", () => {
     }
   });
 
-  it("uses on-demand billing so seeding never waits on capacity", () => {
-    template.hasResourceProperties("AWS::DynamoDB::Table", {
-      BillingMode: "PAY_PER_REQUEST",
-    });
+  it("puts every table on on-demand billing so seeding never waits on capacity", () => {
+    for (const [id, table] of Object.entries(tables())) {
+      expect(table.Properties.BillingMode, id).toBe("PAY_PER_REQUEST");
+    }
   });
 
   // The Lambdas address the tables by name through buildLocalEnv, so the names
@@ -123,15 +145,19 @@ describe("LocalDataStack", () => {
     expect(names.sort()).toEqual(Object.values(localTableNames).sort());
   });
 
-  // The record the later tasks read rather than re-deriving names. The names
-  // themselves are pinned against the template above, because `Table.tableName`
-  // hands back the table's Ref, not the explicit name it was constructed with.
+  // The record the later tasks read. Asserted against the template rather than
+  // against `Table.tableName`, which hands back the table's Ref token.
   it("exposes every table on the typed record the later tasks read", () => {
     expect(Object.keys(stack.tables).sort()).toEqual(
       [...LOCAL_TABLE_NAMES].sort(),
     );
     for (const name of LOCAL_TABLE_NAMES) {
-      expect(stack.tables[name].node.id).toBe(`${name}Table`);
+      const ref = stack.resolve(stack.tables[name].tableName) as {
+        Ref: string;
+      };
+      expect(tables()[ref.Ref]?.Properties.TableName, name).toBe(
+        localTableNames[name],
+      );
     }
   });
 
@@ -155,21 +181,23 @@ describe("LocalDataStack", () => {
     }
   });
 
-  // `IsbDataResources` also builds Cognito, identity pools, SAML, and SSM
-  // parameters — none of which the Hobby tier of LocalStack serves. Importing
-  // it is not an option, so its absence here is what keeps the duplication of
-  // the table definitions honest rather than accidental.
-  it("brings none of IsbDataResources' unsupported surface with it", () => {
-    const types = Object.values(template.findResources("*")).map(
-      (resource) => resource.Type,
+  // `IsbDataResources` also builds Cognito user and identity pools, a SAML
+  // provider, AppConfig, an IAM policy, and an SSM parameter — none of which
+  // the LocalStack Community (Hobby) tier serves. Importing it is not an
+  // option, so pinning the whole resource list is what keeps the duplication of
+  // the table definitions honest rather than accidental. Read from the
+  // synthesized template directly: `findResources("*")` matches nothing.
+  it("creates only the key and the seven tables", () => {
+    const resources = Object.values(
+      template.toJSON().Resources as Record<string, { Type: string }>,
     );
-    for (const type of [
-      "AWS::Cognito::UserPool",
-      "AWS::SSM::Parameter",
-      "AWS::IAM::ManagedPolicy",
-      "AWS::Cognito::IdentityPool",
-    ]) {
-      expect(types, type).not.toContain(type);
-    }
+    const counts = resources.reduce<Record<string, number>>((acc, resource) => {
+      acc[resource.Type] = (acc[resource.Type] ?? 0) + 1;
+      return acc;
+    }, {});
+    expect(counts).toEqual({
+      "AWS::DynamoDB::Table": LOCAL_TABLE_NAMES.length,
+      "AWS::KMS::Key": 1,
+    });
   });
 });
