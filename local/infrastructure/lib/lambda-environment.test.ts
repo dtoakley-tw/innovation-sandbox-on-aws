@@ -54,6 +54,16 @@ describe("buildLocalEnv", () => {
     expect(env.CONFIG_TABLE_NAME).toBe("some-other-config-table");
   });
 
+  // Overrides exist so a later task can hand a Lambda something commonEnv does
+  // not set, so a key no schema describes is passed through rather than
+  // rejected or dropped.
+  it("passes through an override no schema describes", () => {
+    const env = buildLocalEnv(LeaseTemplateLambdaEnvironmentSchema, {
+      SOME_FUTURE_VARIABLE: "yes",
+    });
+    expect(env.SOME_FUTURE_VARIABLE).toBe("yes");
+  });
+
   it("sets ISB_LOCAL_JWKS_URI to the in-network edge address", () => {
     const env = buildLocalEnv(LeaseTemplateLambdaEnvironmentSchema);
     expect(env.ISB_LOCAL_JWKS_URI).toBe(LOCAL_JWKS_URI);
