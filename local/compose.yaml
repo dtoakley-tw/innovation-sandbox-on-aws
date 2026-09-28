@@ -59,6 +59,24 @@ services:
       # The repository, so the edge runs the working tree rather than a copy
       # that has to be rebuilt after every edit.
       - ..:/workspace
+      # The `node_modules` in that working tree, shadowed by a volume of its own,
+      # so the `npm install` above writes *here* and not into the host's tree.
+      # Without this the edge, running Linux, prunes the host's platform-specific
+      # optional dependencies — `node_modules/@esbuild` loses its `darwin-*`
+      # package — and every host-side tool that shells out to one of them stops
+      # working. `cdk deploy` did, immediately after this script had finished a
+      # successful `npm install`: "You installed esbuild for another platform than
+      # the one you're currently using." The lockfile is left alone (npm found it
+      # already satisfying), so the dependency tree was the only thing the
+      # container was writing outside its own filesystem.
+      #
+      # Named rather than anonymous, and deliberately kept across
+      # `docker compose down`, so the install survives a stop and start instead
+      # of running again on every `local:up` — it is a dependency cache, not
+      # state, exactly as the host's own `node_modules` is. `local-down.sh`
+      # preserves `local/.keys` for the same reason. `docker compose down -v`
+      # (or `docker volume rm`) is what clears it.
+      - edge-node-modules:/workspace/node_modules
     depends_on:
       localstack:
         condition: service_healthy
@@ -71,3 +89,10 @@ services:
 networks:
   isb-local:
     name: isb-local
+
+# The edge's dependencies, kept out of the host's working tree. Declared at the
+# top level rather than inline so compose creates a real named volume it can be
+# addressed by; see the `isb-local-edge` service for why the edge needs one, and
+# for why it outlives `docker compose down`.
+volumes:
+  edge-node-modules:

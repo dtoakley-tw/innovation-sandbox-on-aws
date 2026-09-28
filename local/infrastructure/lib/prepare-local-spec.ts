@@ -48,8 +48,10 @@ export function prepareLocalSpec(
     );
   }
 
-  // Clone so the imported contract on disk is never mutated across synths.
-  const spec = prepareApiGatewaySpec(structuredClone(contract), lambdaArns);
+  // The clone happens inside `prepareApiGatewaySpec`, over a pure transform, so
+  // the contract read off disk here is never mutated — one clone per call is
+  // enough and a second would only be work this file does not need to do.
+  const spec = prepareApiGatewaySpec(contract, lambdaArns);
   // No gateway-level authorization: see the note above.
   delete spec.security;
   // Two deletions, not one. `prepareApiGatewaySpec` sets

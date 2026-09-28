@@ -2,11 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 import { App } from "aws-cdk-lib";
 import { Template } from "aws-cdk-lib/assertions";
+import { createHash } from "node:crypto";
 import {
   existsSync,
   mkdtempSync,
   readFileSync,
   readdirSync,
+  realpathSync,
   rmSync,
   statSync,
 } from "node:fs";
@@ -21,7 +23,10 @@ import {
   type LocalTableName,
 } from "../../shared/names.js";
 import { LOCAL_JWKS_URI } from "./lambda-environment.js";
-import { LocalComputeStack } from "./local-compute-stack.js";
+import {
+  LocalComputeStack,
+  resolveRe2WasmBinary,
+} from "./local-compute-stack.js";
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "../../..");
 
@@ -221,9 +226,7 @@ describe("LocalComputeStack", () => {
   // bundling command hook, and this pins where it lands.
   it("ships re2.wasm next to the bundle, where the wrapper looks for it", () => {
     expect(artifacts()).toHaveLength(DOMAINS.length);
-    const source = statSync(
-      join(repoRoot, "node_modules/re2-wasm/build/wasm/re2.wasm"),
-    ).size;
+    const source = statSync(resolveRe2WasmBinary()).size;
     for (const artifact of artifacts()) {
       const entries = readdirSync(artifact);
       // The wrapper resolves its binary as `__dirname + "/re2.wasm"`, and
@@ -242,11 +245,62 @@ describe("LocalComputeStack", () => {
       // copying it, and this is what distinguishes the two.
       expect(statSync(join(artifact, "re2.wasm")).size, artifact).toBe(source);
       // And the lookup is still the `__dirname`-relative one that placement
-      // assumes. esbuild inlines the wrapper verbatim; it does not rewrite
-      // `__dirname` into anything the artifact's own layout can satisfy.
+      // assumes. Asserted as the *statement* the Emscripten glue makes, not as
+      // the word `__dirname`: any bundle of this code mentions `__dirname`
+      // somewhere, and only this exact expression is what turns the artifact
+      // root into the path the binary is read from. esbuild inlines the wrapper
+      // verbatim; it does not rewrite it.
       const bundle = readFileSync(join(artifact, "index.js"), "utf-8");
-      expect(bundle, artifact).toContain("__dirname");
-      expect(bundle, artifact).toContain("re2.wasm");
+      expect(bundle, artifact).toContain('scriptDirectory = __dirname + "/"');
+      expect(bundle, artifact).toContain('wasmBinaryFile = "re2.wasm"');
+    }
+  });
+
+  // `local/package.json` does not declare `re2-wasm`; the layer package does, and
+  // npm hoists it to the repository root. That is the only reason a hard-coded
+  // `repoRoot + "node_modules/…"` path ever worked, so it is the invariant worth
+  // pinning: if a dedupe change or a version conflict nests the copy, resolution
+  // should keep working — and the artifact must hold *the copy that was actually
+  // resolved*, not whichever one sits at the root.
+  it("resolves re2-wasm the way node does, and copies that very binary", () => {
+    const resolved = resolveRe2WasmBinary();
+    const hoisted = join(repoRoot, "node_modules/re2-wasm/build/wasm/re2.wasm");
+    // Today they are the same file. The assertion is the hoisting itself, so a
+    // restructure that moves the package is visible here rather than as a synth
+    // abort six weeks later.
+    expect(realpathSync(resolved)).toBe(realpathSync(hoisted));
+    // And the bytes in every artifact are that file's bytes, compared by digest
+    // rather than by a structural equality check over 858 KB of buffer, which is
+    // several seconds slower and no stronger.
+    const digest = (file: string) =>
+      createHash("sha256").update(readFileSync(file)).digest("hex");
+    const wanted = digest(resolved);
+    for (const artifact of artifacts()) {
+      expect(digest(join(artifact, "re2.wasm")), artifact).toBe(wanted);
+    }
+  });
+
+  // The other half of making that path safe: when it cannot be resolved, the
+  // synth has to stop and say so. `resolveRe2WasmBinary` runs at module load, so
+  // a missing package fails the stack's construction — before a deployment
+  // exists — rather than surfacing as a `cp` error buried in esbuild's output
+  // after a deploy has already been attempted. Driven through the `specifier`
+  // parameter, which exists for this test.
+  it("fails at synth, by name, when the package cannot be resolved", () => {
+    expect(() =>
+      resolveRe2WasmBinary("re2-wasm/nonexistent/package.json"),
+    ).toThrow(/cannot resolve "re2-wasm\/nonexistent\/package\.json"/);
+    // The message has to name the package and the layout, or a developer is left
+    // with a stack trace and no next step — the two things a person needs are
+    // "which package" and "where in it".
+    for (const fragment of [
+      "re2-wasm",
+      "source/layers/dependencies/package.json",
+      "build/wasm/re2.wasm",
+    ]) {
+      expect(() => resolveRe2WasmBinary("re2-wasm/nope.json")).toThrow(
+        fragment,
+      );
     }
   });
 

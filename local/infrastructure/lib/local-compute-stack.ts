@@ -13,7 +13,8 @@ import {
   type ICommandHooks,
 } from "aws-cdk-lib/aws-lambda-nodejs";
 import type { Construct } from "constructs";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ZodType } from "zod";
@@ -56,15 +57,93 @@ const HANDLERS: Record<ApiDomain, string> = {
 };
 
 /**
- * `re2-wasm`'s WebAssembly binary, as installed. See `copyRe2Wasm` for why the
- * Lambda artifact needs it and why esbuild cannot be asked to bring it along.
+ * The `re2-wasm` package, resolved from *this module's* location, and the layout
+ * the WebAssembly binary has inside it. The binary is not a free-floating file
+ * to be found by name: it is a build artifact of the package, and the package is
+ * only installed because something else declares it.
+ *
+ * `local/package.json` does **not** declare `re2-wasm`. The one declaration in
+ * this repository is `source/layers/dependencies/package.json` — the Lambda
+ * layer whose packages upstream externalizes, and the layer this profile
+ * deliberately cannot use because the LocalStack Hobby tier has none. That
+ * declaration is why `re2-wasm` is on disk at all, and **it is the thing that
+ * would have to change for this profile to break**: delete that layer workspace,
+ * drop its dependency, or let a version conflict nest the copy, and every local
+ * Lambda stops bundling. Nothing in `local/` can protect against that, so the
+ * failure is made loud instead (see `resolveRe2WasmBinary`) and the coupling is
+ * recorded here.
+ *
+ * Declaring it in `local/package.json` as well would not remove the coupling, it
+ * would duplicate it: a second version range for a package the layer already
+ * owns, in a workspace whose install is locked by the repository-root
+ * `package-lock.json`. Resolution from this module walks the real `node_modules`
+ * chain instead, so a hoisted copy, a copy nested under the layer, and a copy in
+ * `local/node_modules` are all found without the profile having to care which.
  */
-const RE2_WASM_PATH = "node_modules/re2-wasm/build/wasm/re2.wasm";
+const RE2_WASM_PACKAGE = "re2-wasm";
+const RE2_WASM_MANIFEST = `${RE2_WASM_PACKAGE}/package.json`;
+/** Where the binary sits inside the package, relative to its manifest. */
+const RE2_WASM_WITHIN_PACKAGE = ["build", "wasm", "re2.wasm"];
+
+/**
+ * The absolute path of `re2-wasm`'s WebAssembly binary, or a thrown error naming
+ * what is missing and where it was expected.
+ *
+ * Resolved when this module is loaded, i.e. at synth, rather than left to the
+ * `cp` in `copyRe2Wasm`. That is deliberate and it is the whole reason the
+ * resolution happens here: a `cp` of a missing source fails as a shell error
+ * inside esbuild's output, some seconds later, with a path and no explanation —
+ * whereas this throws during the stack's own construction, before any
+ * deployment exists, saying which package and which layout inside it.
+ *
+ * `specifier` is a parameter only so a test can drive the failure; production
+ * callers take the default.
+ */
+export function resolveRe2WasmBinary(
+  specifier: string = RE2_WASM_MANIFEST,
+): string {
+  const expected = `${RE2_WASM_PACKAGE}/<package directory>/${RE2_WASM_WITHIN_PACKAGE.join("/")}`;
+  let manifest: string;
+  try {
+    manifest = createRequire(import.meta.url).resolve(specifier);
+  } catch (cause) {
+    throw new Error(
+      `local compute stack: cannot resolve "${specifier}". The local Lambdas ` +
+        `need the ${RE2_WASM_PACKAGE} package, which local/package.json does not ` +
+        `declare: its only declaration in this repository is ` +
+        `source/layers/dependencies/package.json, the Lambda layer this profile ` +
+        `cannot use. Install it, or restore that dependency. Expected layout: ` +
+        `${expected}.`,
+      { cause },
+    );
+  }
+  const binary = join(dirname(manifest), ...RE2_WASM_WITHIN_PACKAGE);
+  if (!existsSync(binary)) {
+    throw new Error(
+      `local compute stack: resolved "${specifier}" to ${manifest}, which does ` +
+        `not contain the WebAssembly binary at ${RE2_WASM_WITHIN_PACKAGE.join("/")}. ` +
+        `Every local Lambda would cold-start-fail on a missing re2.wasm. Expected ` +
+        `layout: ${expected}.`,
+    );
+  }
+  return binary;
+}
+
+/** Where the binary is, resolved once per synth. */
+const re2WasmBinary = resolveRe2WasmBinary();
 
 /** Single-quotes a path for the `bash -c` the bundling command runs under. */
 const shellQuote = (value: string) => `'${value.replaceAll("'", `'\\''`)}'`;
 
 const copyRe2Wasm: ICommandHooks = {
+  // All three methods are part of `ICommandHooks` and all three must be present:
+  // CDK calls `beforeBundling` and `afterBundling` unconditionally, so a missing
+  // method is a `TypeError` at synth. `beforeInstall` is only called when
+  // `nodeModules` is set — and it must stay empty if that ever changes. Adding
+  // `nodeModules: ["re2-wasm"]` to reach the package through a node_modules
+  // install would run `npm ci` inside the bundle step, which needs the network
+  // and is the one thing an offline profile cannot do; the resolution above
+  // exists so that is never necessary.
   beforeBundling: () => [],
   beforeInstall: () => [],
   /**
@@ -89,13 +168,22 @@ const copyRe2Wasm: ICommandHooks = {
    * same outcome is reached the only other way available: copy the binary to
    * the artifact root, which is exactly where the inlined wrapper looks.
    *
-   * `inputDir` is the project root under local bundling, which is the only mode
-   * this profile supports — `cp` failing loudly on a missing source is the
-   * intended failure, since the alternative is a bundle that cold-start-fails
-   * in front of a developer with nothing to act on.
+   * The source is the absolute path resolved by `resolveRe2WasmBinary`, not a
+   * path relative to CDK's `projectRoot` (which under local bundling happens to
+   * be this repository root, and which says nothing about *why*). The `cp` runs
+   * on the host, so the absolute path is the only form that cannot silently
+   * point somewhere else; under Docker bundling it would not resolve inside the
+   * container and would fail, which is the correct outcome — see the note on
+   * `esbuild` below.
+   *
+   * `esbuild` is likewise not declared by `local/package.json`; it arrives
+   * transitively through `vite` and `tsx`. If it is ever missing, CDK does not
+   * fail — it silently falls back to bundling inside a Docker image, where the
+   * absolute `re2.wasm` path above does not exist, and the `cp` is what finally
+   * says so.
    */
-  afterBundling: (inputDir: string, outputDir: string) => [
-    `cp ${shellQuote(join(inputDir, RE2_WASM_PATH))} ${shellQuote(join(outputDir, "re2.wasm"))}`,
+  afterBundling: (_inputDir: string, outputDir: string) => [
+    `cp ${shellQuote(re2WasmBinary)} ${shellQuote(join(outputDir, "re2.wasm"))}`,
   ],
 };
 
@@ -166,8 +254,13 @@ export class LocalComputeStack extends Stack {
         stageName: LOCAL_STAGE,
         // X-Ray is not available on the Hobby tier.
         tracingEnabled: false,
-        throttlingRateLimit: 200,
-        throttlingBurstLimit: 400,
+        // Production's own defaults (`cdk-context.ts`: rate 100, burst 200),
+        // which it takes from `cdk.json` context when it is set. The local app
+        // sets no context, so the defaults are the values, and restating them
+        // here rather than importing `getContextFromMapping` keeps the number in
+        // one place: production's schema, not a local guess at a local cap.
+        throttlingRateLimit: 100,
+        throttlingBurstLimit: 200,
       },
       // A `AWS::ApiGateway::Account` role exists only to write access logs, and
       // the local stage has none. Creating it would put a CloudWatch-dependent
@@ -226,6 +319,14 @@ export class LocalComputeStack extends Stack {
       entry: join(repoRoot, HANDLERS[domain]),
       handler: "handler",
       runtime: Runtime.NODEJS_24_X,
+      // No `architecture`, unlike upstream's `Architecture.ARM_64`. LocalStack
+      // does not honour it: it starts the runtime's container on the host's
+      // architecture, so the declared value describes something that never
+      // happens locally, and pinning ARM_64 would fail a developer whose Docker
+      // has no arm64 image or emulation. Verified on an arm64 host — an ARM_64
+      // declaration deploys and serves identically, which is the point: the
+      // setting is inert here, so the profile leaves it at CDK's default rather
+      // than asserting a capability the local tier does not implement.
       timeout: Duration.minutes(1),
       memorySize: 1024,
       // X-Ray is not on the Hobby tier. `Tracing.DISABLED` is what the runtime

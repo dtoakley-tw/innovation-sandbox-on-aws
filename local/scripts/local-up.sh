@@ -15,7 +15,9 @@ cd "$root"
 # local/infrastructure/lib/lambda-environment.ts. They are literals here
 # because compose and bash cannot import a TypeScript constant without a build
 # step; `scripts.test.ts` asserts all three files agree, so a rename fails a
-# test instead of hanging on a connection to nothing.
+# test instead of hanging on a connection to nothing. The account id in
+# `bootstrap_target` further down is a third such literal, for the same reason
+# and with the same guard.
 
 # Polls `$1` until it answers 2xx, at most `$2` times (default 60) `$3` seconds
 # apart (default 2). Bounded, and loud on failure, because every step after the
@@ -59,10 +61,62 @@ export AWS_ACCESS_KEY_ID="test"
 export AWS_SECRET_ACCESS_KEY="test"
 export AWS_REGION="us-east-1"
 export AWS_DEFAULT_REGION="us-east-1"
+
+# The CDK CLI cannot publish the six Lambda artifacts without its bootstrap stack
+# in the target account, and a LocalStack container that has just started has
+# none: `cdk deploy` stops with `Parameter /cdk-bootstrap/... not found` before
+# creating a single resource, so a first `local:up` on a clean machine never got
+# as far as deploying anything. Created here, once, and skipped once it is there
+# so a re-run pays nothing for it.
+#
+# The account is a literal because bash cannot import a TypeScript constant
+# without a build step. It is LOCAL_ACCOUNT_ID in local/shared/names.ts and the
+# same account `local/infrastructure/bin/local.ts` pins both stacks to;
+# `scripts.test.ts` asserts the two agree, because bootstrapping one account and
+# deploying to another is a failure that looks like a missing bootstrap.
+bootstrap_target="aws://000000000000/${AWS_REGION}"
+
+# Asked of LocalStack directly, through the `awslocal` CLI its image ships,
+# rather than inferred from whether a deploy succeeds: the toolkit stack is a
+# fact about the account, and asking is both cheaper and clearer than
+# discovering it by failing. `CDKToolkit` is the CDK default toolkit stack name.
+is_bootstrapped() {
+  docker compose -f local/compose.yaml exec -T localstack \
+    awslocal cloudformation describe-stacks --stack-name CDKToolkit \
+    >/dev/null 2>&1
+}
+
+bootstrap_cdk() {
+  if is_bootstrapped; then
+    echo "==> CDK is already bootstrapped in LocalStack"
+    return 0
+  fi
+  echo "==> bootstrapping CDK in $bootstrap_target"
+  # The env vars above are what make this reach LocalStack rather than real AWS,
+  # and they are already exported by the time this runs.
+  npx cdk bootstrap "$bootstrap_target" || {
+    echo "cdk bootstrap failed for $bootstrap_target" >&2
+    echo "  LocalStack may still be initialising. Retry, or run it by hand:" >&2
+    echo "  AWS_ENDPOINT_URL=$AWS_ENDPOINT_URL npx cdk bootstrap $bootstrap_target" >&2
+    exit 1
+  }
+}
+
+bootstrap_cdk
+
 # `--require-approval never` because this is a throwaway stack in LocalStack and
 # a prompt here would hang `npm run local:up`, which is run unattended by the
 # verify script as well as by hand.
-npx cdk deploy --app "npx tsx local/infrastructure/bin/local.ts" \
+# `--all` because the app registers two stacks, `IsbLocalData` and
+# `IsbLocalCompute`, and they are independent of each other — nothing in the
+# compute stack references a resource in the data stack, because the Lambdas
+# address the tables by name from `localTableNames` rather than through
+# references. A bare `cdk deploy` refuses to choose between them ("Since this app
+# includes more than a single stack, specify which stacks to use"), so one stack
+# would go undeployed and the profile would be half up. `--all` also matches how
+# the outputs are read below: every stack's outputs are scanned, and the API id
+# and invoke URL come from the one stack that carries them.
+npx cdk deploy --all --app "npx tsx local/infrastructure/bin/local.ts" \
   --require-approval never \
   --outputs-file local/cdk.out/local-outputs.json || {
   echo "local resource deployment failed; run \`npm run local:logs\` for the LocalStack view" >&2

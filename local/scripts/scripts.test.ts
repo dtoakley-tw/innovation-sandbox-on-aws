@@ -19,7 +19,12 @@ import {
   LOCAL_JWKS_URI,
   LOCALSTACK_ENDPOINT,
 } from "../infrastructure/lib/lambda-environment.js";
-import { LOCAL_EDGE_PORT, LOCAL_REGION, LOCAL_STAGE } from "../shared/names.js";
+import {
+  LOCAL_ACCOUNT_ID,
+  LOCAL_EDGE_PORT,
+  LOCAL_REGION,
+  LOCAL_STAGE,
+} from "../shared/names.js";
 
 const localDir = join(dirname(fileURLToPath(import.meta.url)), "..");
 const repoRoot = join(localDir, "..");
@@ -134,6 +139,43 @@ describe("local compose profile", () => {
     expect(read("compose.yaml")).toContain(
       `"${LOCAL_EDGE_PORT}:${LOCAL_EDGE_PORT}"`,
     );
+  });
+
+  // The edge installs its dependencies into the working tree it is bind-mounted,
+  // which means the host's. Running Linux, npm prunes the host's
+  // platform-specific optional dependencies — `node_modules/@esbuild` loses its
+  // `darwin-*` package — and every host-side tool that shells out to one of them
+  // fails afterwards with "You installed esbuild for another platform". Observed
+  // directly: a clean `local:up` deployed nothing and left the host's esbuild
+  // unusable, which is the worst possible outcome for a script whose whole job
+  // is to leave a working profile behind.
+  it("keeps the edge's dependency install out of the host's working tree", () => {
+    const compose = read("compose.yaml");
+    const mounts = composeList("isb-local-edge", "volumes");
+    // The repository, so edits take effect without a rebuild — that part is the
+    // point of the mount and has to stay.
+    expect(mounts).toContain("..:/workspace");
+    // And a volume shadowing the dependency tree inside it.
+    const shadow = mounts.find((mount) =>
+      mount.endsWith("/workspace/node_modules"),
+    );
+    expect(shadow).toBeDefined();
+    // A named volume, not an anonymous one: an anonymous volume cannot be
+    // addressed, and compose would accumulate one per recreate.
+    const [name] = (shadow as string).split(":");
+    expect(name).toBe("edge-node-modules");
+    // Declared at the top level, or compose treats the service reference as a
+    // bind mount of a path that does not exist on the host.
+    expect(compose).toMatch(/^volumes:\n {2}edge-node-modules:/m);
+    // And nothing else in the file mounts state into a container.
+    for (const service of ["localstack", "isb-local-edge"]) {
+      expect(
+        composeList(service, "volumes").filter((mount) =>
+          /^\.\..*node_modules/.test(mount),
+        ),
+        service,
+      ).toEqual([]);
+    }
   });
 
   it("runs LocalStack without a persistent volume so reset is unambiguous", () => {
@@ -362,8 +404,108 @@ exit $status`,
     expect(up).toContain(`export AWS_REGION="${LOCAL_REGION}"`);
     expect(up).toMatch(/export AWS_ACCESS_KEY_ID="test"/);
     expect(up).toMatch(/export AWS_SECRET_ACCESS_KEY="test"/);
+    // Anchored to the deploy command line, not to the first mention of the words:
+    // the bootstrap comment above it also says `cdk deploy`, and an indexOf on
+    // the phrase would silently start comparing against prose.
     expect(up.indexOf("export AWS_ENDPOINT_URL")).toBeLessThan(
-      up.indexOf("cdk deploy"),
+      up.search(/^npx cdk deploy /m),
+    );
+  });
+
+  // The CDK CLI needs its bootstrap stack in the target account before it can
+  // publish the six Lambda artifacts, and a LocalStack container that has just
+  // started has none. Without this, a first `local:up` on a clean machine stops
+  // at `cdk deploy` with `Parameter /cdk-bootstrap/... not found`, having
+  // created nothing. Three things have to hold, and each is a separate way the
+  // bootstrap could be got wrong while looking correct.
+  describe("bootstrapping CDK in LocalStack", () => {
+    it("bootstraps the same account and region the stacks deploy to", () => {
+      const up = read("scripts/local-up.sh");
+      const target = up.match(/^bootstrap_target="([^"]+)"/m)?.[1];
+      expect(target).toBe(`aws://${LOCAL_ACCOUNT_ID}/\${AWS_REGION}`);
+      // The region is the exported one rather than a second literal, so the two
+      // cannot name different regions.
+      expect(up.indexOf(`bootstrap_target=`)).toBeGreaterThan(
+        up.indexOf(`export AWS_REGION="${LOCAL_REGION}"`),
+      );
+      // And the app itself pins both stacks to that same account, or the CLI
+      // would bootstrap one account and deploy to another — which surfaces as
+      // the same "not found" it was supposed to fix.
+      const app = read("infrastructure/bin/local.ts");
+      expect(app).toContain(`account: "${LOCAL_ACCOUNT_ID}"`);
+      expect(app).toContain(`region: "${LOCAL_REGION}"`);
+    });
+
+    it("bootstraps before it deploys, and skips the work when it is already there", () => {
+      const up = read("scripts/local-up.sh");
+      const body = bashFunction(up, "bootstrap_cdk");
+      // Asked, not assumed: the toolkit stack either is in the account or is not,
+      // and LocalStack is the only thing that knows.
+      expect(bashFunction(up, "is_bootstrapped")).toMatch(
+        /awslocal cloudformation describe-stacks --stack-name CDKToolkit/,
+      );
+      expect(body).toContain("if is_bootstrapped; then");
+      // A re-run must not pay for the bootstrap, so the guard returns before the
+      // CLI is ever invoked rather than invoking it and hoping it is cheap.
+      expect(body.indexOf("if is_bootstrapped")).toBeLessThan(
+        body.indexOf("cdk bootstrap"),
+      );
+      // And it happens before the deploy, not after a failure. Anchored to the
+      // two command lines, because the prose above each of them names the other.
+      const callAt = up.search(/^bootstrap_cdk$/m);
+      const deployAt = up.search(/^npx cdk deploy /m);
+      expect(callAt).toBeGreaterThan(-1);
+      expect(deployAt).toBeGreaterThan(-1);
+      expect(callAt).toBeLessThan(deployAt);
+    });
+
+    // `cdk bootstrap` reaching real AWS is the worst outcome this script could
+    // have, so the endpoint it inherits has to be the LocalStack one — which is
+    // only true because the exports above it run first. The index comparison is
+    // the assertion; a duplicated literal would pass a `toContain`.
+    it("inherits the LocalStack endpoint, never real AWS", () => {
+      const up = read("scripts/local-up.sh");
+      const call = up.indexOf('cdk bootstrap "$bootstrap_target"');
+      expect(call).toBeGreaterThan(-1);
+      expect(
+        up.indexOf(`export AWS_ENDPOINT_URL="${LOCALSTACK_ENDPOINT}"`),
+      ).toBeLessThan(call);
+    });
+
+    // A bootstrap that fails says so and says what to do. `set -e` would abort
+    // on a bare `npx cdk bootstrap` with the CLI's own message and nothing else,
+    // which does not mention the endpoint or the fact that LocalStack may simply
+    // not be ready.
+    it("explains a bootstrap failure instead of aborting silently", () => {
+      const body = bashFunction(read("scripts/local-up.sh"), "bootstrap_cdk");
+      expect(body).toMatch(/npx cdk bootstrap "\$bootstrap_target" \|\| \{/);
+      expect(body).toContain("cdk bootstrap failed for $bootstrap_target");
+      // The hand-run line a developer can copy, and it names the endpoint so the
+      // copy does not silently go to AWS.
+      expect(body).toContain(
+        "AWS_ENDPOINT_URL=$AWS_ENDPOINT_URL npx cdk bootstrap $bootstrap_target",
+      );
+    });
+  });
+
+  // The app registers two independent stacks — nothing in the compute stack
+  // references a resource in the data stack — so the CLI cannot pick one. A bare
+  // `cdk deploy` refuses outright ("Since this app includes more than a single
+  // stack, specify which stacks to use"), which left `local:up` unable to deploy
+  // anything at all.
+  it("deploys every stack the app registers", () => {
+    const up = read("scripts/local-up.sh");
+    expect(up).toMatch(/npx cdk deploy --all --app/);
+    // The app really does register two, or `--all` is claiming something false.
+    const app = read("infrastructure/bin/local.ts");
+    expect(app).toContain(`new LocalDataStack(app, "IsbLocalData"`);
+    expect(app).toContain(`new LocalComputeStack(app, "IsbLocalCompute"`);
+    // And the outputs are read across every stack, so `--all` writing both
+    // stacks' outputs into one file is what the read expects.
+    const id = up.match(/ApiGatewayRestApiId/g) ?? [];
+    expect(id.length).toBeGreaterThan(0);
+    expect(up).toMatch(
+      /Object\.values\(o\)\.map\(s=>s\?\.ApiGatewayRestApiId\)/,
     );
   });
 
