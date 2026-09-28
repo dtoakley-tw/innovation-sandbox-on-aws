@@ -64,8 +64,6 @@ export const SEED_TIME = "2026-01-15T12:00:00.000Z";
  */
 export const ADMIN_EMAIL = "admin@example.local";
 
-const OWNER_EMAIL = ADMIN_EMAIL;
-
 /**
  * An epoch far enough out that DynamoDB never reaps the records carrying it.
  * The lease and principal tables both declare `ttl` as their TTL attribute and
@@ -92,16 +90,22 @@ export interface SeedFixtures {
  * and `local/edge/mint-token.ts` signs locally. What the seed contributes is
  * the principal a lease can be shared with.
  *
- * The ids are UUIDs because `IdcPrincipalIdSchema` requires one. They
- * deliberately differ from the local edge's `sub` of `local-admin`, which that
- * schema would reject; nothing looks a principal up by the signed-in user's own
- * id, so the mismatch is inert today.
+ * The ids are UUIDs because `IdcPrincipalIdSchema` requires one, and the local
+ * edge's `sub` of `local-admin` does not satisfy it. That is a live defect in
+ * the local identity, not a quirk of this fixture: `custom:idc_user_id` reaches
+ * the API as the caller's own id, and any flow that validates it against
+ * `IdcPrincipalIdSchema` rejects it with a 400 before the role gate runs — see
+ * `listSharedLeases` in
+ * `source/lambdas/api/leases/src/smithy/lease-operations.ts:789` and
+ * `getGroupMembershipCache` at `:311`. Seeding a matching id here would not
+ * help; the token is the thing that has to change, and that is not this
+ * module's to fix.
  */
 const PRINCIPALS = [
   {
     principalId: "0aaa0000-0000-4000-8000-000000000001",
     displayName: "Local Admin",
-    email: OWNER_EMAIL,
+    email: ADMIN_EMAIL,
   },
   {
     principalId: "0aaa0000-0000-4000-8000-000000000002",
@@ -201,13 +205,13 @@ const ACCOUNTS = [
 
 export function buildSeedFixtures(): SeedFixtures {
   const blueprints = BLUEPRINTS.map((blueprint) =>
-    BlueprintItemSchema.parse({ ...blueprint, createdBy: OWNER_EMAIL }),
+    BlueprintItemSchema.parse({ ...blueprint, createdBy: ADMIN_EMAIL }),
   );
 
   const leaseTemplates = LEASE_TEMPLATES.map((template) =>
     PersistedLeaseTemplateSchema.parse({
       ...template,
-      createdBy: OWNER_EMAIL,
+      createdBy: ADMIN_EMAIL,
     }),
   );
 
@@ -223,11 +227,11 @@ export function buildSeedFixtures(): SeedFixtures {
   // `PendingApproval` lease that still carries an `awsAccountId`.
   const pendingLease = PendingLeaseSchema.parse({
     uuid: "0ddd0000-0000-4000-8000-000000000001",
-    userEmail: OWNER_EMAIL,
+    userEmail: ADMIN_EMAIL,
     status: "PendingApproval",
     originalLeaseTemplateUuid: standard.uuid,
     originalLeaseTemplateName: standard.name,
-    createdBy: OWNER_EMAIL,
+    createdBy: ADMIN_EMAIL,
     blueprintId: standard.blueprintId,
     blueprintName: standard.blueprintName,
     comments:
@@ -242,11 +246,11 @@ export function buildSeedFixtures(): SeedFixtures {
 
   const activeLease = MonitoredLeaseSchema.parse({
     uuid: "0ddd0000-0000-4000-8000-000000000002",
-    userEmail: OWNER_EMAIL,
+    userEmail: ADMIN_EMAIL,
     status: "Active",
     originalLeaseTemplateUuid: standard.uuid,
     originalLeaseTemplateName: standard.name,
-    createdBy: OWNER_EMAIL,
+    createdBy: ADMIN_EMAIL,
     blueprintId: standard.blueprintId,
     blueprintName: standard.blueprintName,
     allowOwnerToShareLease: standard.allowOwnerToShareLease,
@@ -265,11 +269,11 @@ export function buildSeedFixtures(): SeedFixtures {
 
   const expiredLease = ExpiredLeaseSchema.parse({
     uuid: "0ddd0000-0000-4000-8000-000000000003",
-    userEmail: OWNER_EMAIL,
+    userEmail: ADMIN_EMAIL,
     status: "Expired",
     originalLeaseTemplateUuid: exploratory.uuid,
     originalLeaseTemplateName: exploratory.name,
-    createdBy: OWNER_EMAIL,
+    createdBy: ADMIN_EMAIL,
     blueprintId: exploratory.blueprintId,
     blueprintName: exploratory.blueprintName,
     allowOwnerToShareLease: exploratory.allowOwnerToShareLease,

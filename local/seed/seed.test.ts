@@ -1,7 +1,13 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 import { describe, expect, it } from "vitest";
+import type { z } from "zod";
 
+import {
+  BLUEPRINT_PK_PREFIX,
+  BLUEPRINT_SK,
+  generateBlueprintPK,
+} from "@amzn/innovation-sandbox-commons/data/blueprint/blueprint-dynamodb-keys.js";
 import {
   BlueprintSchemaVersion,
   PersistedBlueprintItemSchema,
@@ -37,11 +43,20 @@ describe("seed records", () => {
   it("addresses every record the way the Dynamo stores address them", () => {
     for (const item of itemsFor("blueprint")) {
       // `IsbDataResources` gives the blueprint table a PK/SK key
-      // (`isb-data-resources.ts:125`); a record that ignores this is invisible
-      // to the read path, and `itemType` is the GSI partition key above it.
-      expect(item.PK).toBe(`bp#${item.blueprintId}`);
-      expect(item.SK).toBe("blueprint");
-      expect(item.itemType).toBe("BLUEPRINT");
+      // (`isb-data-resources.ts:125`); a record that ignores this is invisible to
+      // the read path, and `itemType` is the GSI partition key above it. The key
+      // is asserted through the store's own helpers rather than a restated
+      // literal, so changing the prefix in production moves the expectation with
+      // it. What is left to catch here is a seed that stops using the helper,
+      // which the prefix check below does.
+      const { PK, SK, blueprintId, itemType } = item as Record<
+        "PK" | "SK" | "blueprintId" | "itemType",
+        string
+      >;
+      expect(PK).toBe(generateBlueprintPK(blueprintId));
+      expect(PK).toMatch(new RegExp(`^${BLUEPRINT_PK_PREFIX}[0-9a-f-]+$`, "i"));
+      expect(SK).toBe(BLUEPRINT_SK);
+      expect(itemType).toBe("BLUEPRINT");
     }
     for (const item of itemsFor("principal")) {
       // `DynamoPrincipalStore` keys its typeahead cache on a fixed partition and
@@ -59,20 +74,22 @@ describe("seed records", () => {
   });
 
   it("parses every seeded record against its persisted schema", () => {
-    for (const item of itemsFor("sandboxAccount")) {
-      expect(() => PersistedSandboxAccountSchema.parse(item)).not.toThrow();
-    }
-    for (const item of itemsFor("leaseTemplate")) {
-      expect(() => PersistedLeaseTemplateSchema.parse(item)).not.toThrow();
-    }
-    for (const item of itemsFor("blueprint")) {
-      expect(() => PersistedBlueprintItemSchema.parse(item)).not.toThrow();
-    }
-    for (const item of itemsFor("principal")) {
-      expect(() => PersistedPrincipalCacheItemSchema.parse(item)).not.toThrow();
-    }
-    for (const item of itemsFor("lease")) {
-      expect(() => PersistedLeaseSchema.parse(item)).not.toThrow();
+    // Compared against the parse result rather than merely checked not to throw:
+    // the lease branches extend a non-strict `z.object`, so an unexpected key on
+    // a seeded lease is stripped silently and `not.toThrow` would pass.
+    const cases: [SeedWrite["table"], z.ZodType][] = [
+      ["sandboxAccount", PersistedSandboxAccountSchema],
+      ["leaseTemplate", PersistedLeaseTemplateSchema],
+      ["blueprint", PersistedBlueprintItemSchema],
+      ["principal", PersistedPrincipalCacheItemSchema],
+      ["lease", PersistedLeaseSchema],
+    ];
+    for (const [table, schema] of cases) {
+      const items = itemsFor(table);
+      expect(items.length).toBeGreaterThan(0);
+      for (const item of items) {
+        expect(schema.parse(item)).toEqual(item);
+      }
     }
   });
 

@@ -40,12 +40,6 @@ const branchFor = (lease: Lease): z.ZodType =>
 
 const fixtures = buildSeedFixtures();
 
-const expectParses = <T>(schema: z.ZodType<T>, values: unknown[]) => {
-  for (const value of values) {
-    expect(() => schema.parse(value)).not.toThrow();
-  }
-};
-
 describe("seed fixtures", () => {
   it("builds the same fixtures on every run", () => {
     // Every value is pinned rather than generated, so an upstream field the
@@ -56,11 +50,35 @@ describe("seed fixtures", () => {
     );
   });
 
+  it("populates every domain the local environment renders", () => {
+    // Without this, an emptied domain would pass every other test here: each of
+    // the loops below iterates a fixture array, so an empty array is vacuously
+    // conformant and cross-reference-free. The brief called for this and its
+    // version only covered four of the six domains.
+    expect(fixtures.accounts.length).toBeGreaterThan(0);
+    expect(fixtures.blueprints.length).toBeGreaterThan(0);
+    expect(fixtures.leaseTemplates.length).toBeGreaterThan(0);
+    expect(fixtures.principals.length).toBeGreaterThan(0);
+    expect(fixtures.leases.length).toBeGreaterThan(0);
+    expect(Object.keys(fixtures.configSections).length).toBeGreaterThan(0);
+  });
+
   it("parses every fixture against the production schema that describes it", () => {
-    expectParses(PersistedSandboxAccountSchema, fixtures.accounts);
-    expectParses(PersistedLeaseTemplateSchema, fixtures.leaseTemplates);
-    expectParses(BlueprintItemSchema, fixtures.blueprints);
-    expectParses(IdcPrincipalSchema, fixtures.principals);
+    // Compared against the parse result rather than merely checked not to throw,
+    // so a fixture carrying a field its schema does not declare is caught even
+    // where that schema is not strict.
+    const cases: [z.ZodType, unknown[]][] = [
+      [PersistedSandboxAccountSchema, fixtures.accounts],
+      [PersistedLeaseTemplateSchema, fixtures.leaseTemplates],
+      [BlueprintItemSchema, fixtures.blueprints],
+      [IdcPrincipalSchema, fixtures.principals],
+    ];
+    for (const [schema, values] of cases) {
+      expect(values.length).toBeGreaterThan(0);
+      for (const value of values) {
+        expect(schema.parse(value)).toEqual(value);
+      }
+    }
   });
 
   it("builds every lease against the branch its status selects", () => {

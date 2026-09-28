@@ -4,6 +4,10 @@ import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient, PutCommand } from "@aws-sdk/lib-dynamodb";
 import { pathToFileURL } from "node:url";
 
+import {
+  BLUEPRINT_SK,
+  generateBlueprintPK,
+} from "@amzn/innovation-sandbox-commons/data/blueprint/blueprint-dynamodb-keys.js";
 import { BlueprintSchemaVersion } from "@amzn/innovation-sandbox-commons/data/blueprint/blueprint.js";
 import { ConfigSchemaVersion } from "@amzn/innovation-sandbox-commons/data/config/config.js";
 import { LeaseTemplateSchemaVersion } from "@amzn/innovation-sandbox-commons/data/lease-template/lease-template.js";
@@ -92,8 +96,13 @@ export function buildSeedWrites(): SeedWrite[] {
       table: "blueprint" as const,
       item: {
         ...item,
-        PK: `bp#${item.blueprintId}`,
-        SK: "blueprint",
+        // The key comes from the store's own helper, never from a literal here:
+        // `DynamoBlueprintStore` addresses every blueprint item this way, and a
+        // restated prefix would drift silently the moment production changed it.
+        // `itemType` is the one remaining literal, exactly as the store writes it,
+        // and `PersistedBlueprintItemSchema` pins it with `z.literal("BLUEPRINT")`.
+        PK: generateBlueprintPK(item.blueprintId),
+        SK: BLUEPRINT_SK,
         itemType: "BLUEPRINT",
         meta: metadata(BlueprintSchemaVersion),
       },
