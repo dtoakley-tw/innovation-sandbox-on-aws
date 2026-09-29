@@ -181,14 +181,20 @@ describe("seed records", () => {
     }
   });
 
-  it("reports one summary count per domain the fixtures cover", () => {
-    expect(summarizeWrites(writes)).toEqual({
+  it("reports one summary count per domain the fixtures cover, plus the SSM parameters", () => {
+    expect(summarizeWrites(writes, 2)).toEqual({
       accounts: itemsFor("sandboxAccount").length,
       leaseTemplates: itemsFor("leaseTemplate").length,
       blueprints: itemsFor("blueprint").length,
       principals: itemsFor("principal").length,
       leases: itemsFor("lease").length,
       configSections: itemsFor("config").length,
+      ssmParameters: 2,
     });
+    // The count is passed in, not derived from the writes, because the
+    // parameters are not DynamoDB writes. A summary that omitted them would look
+    // identical to one where they were never seeded at all — which is the defect
+    // this seed entry exists to close.
+    expect(summarizeWrites(writes, 0).ssmParameters).toBe(0);
   });
 });

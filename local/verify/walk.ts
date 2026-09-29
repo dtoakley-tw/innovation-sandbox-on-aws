@@ -88,6 +88,13 @@ interface WalkContext {
   token: string;
   options: Required<VerifyOptions>;
   results: VerifyResult[];
+  /**
+   * The seeded template with `requiresApproval: false`, discovered by the read
+   * walk and confirmed by the mutation walk. `walkBoundaries` turns it into the
+   * auto-approval boundary check; `undefined` means the seed has no such
+   * template, which is reported rather than passed over.
+   */
+  autoApprovingTemplate?: DiscoveredLeaseTemplate;
 }
 
 /**
@@ -101,6 +108,40 @@ class BoundaryUndetermined extends Error {
     super(message);
     this.name = "BoundaryUndetermined";
   }
+}
+
+/**
+ * Records a check that could not run, and why.
+ *
+ * Several checks are conditional on something a *previous* check may have
+ * consumed — the seeded Active lease, chiefly. The `quarantine` boundary check
+ * terminates the seeded Active lease, so a second `local:verify` on the same
+ * profile has no Active lease left to `GET /api/leases/{id}` or `PATCH`. The
+ * previous code guarded those with `if (discovered.leaseId)` and simply did not
+ * emit them, so the run reported 39 checks instead of 42 and every one of them
+ * passed. That is the worst possible shape for a verification script: a shrunken
+ * run reads as a *better* run, and nothing in the output says a check was
+ * dropped.
+ *
+ * A skip is therefore reported as a result, in its own group, and it does not
+ * set the exit code — the underlying cause (a boundary check that mutated the
+ * profile) is reported by the check that did it, and `local:reset` is the
+ * documented remedy. What is rejected is the silence, not the situation.
+ */
+function skipCheck(
+  context: WalkContext,
+  name: string,
+  reason: string,
+  options: { path: string; method: string },
+): void {
+  context.results.push({
+    name,
+    ok: true,
+    detail: `skipped: ${reason}`,
+    expectation: "should-work",
+    request: `${options.method} ${options.path}`,
+    skipped: true,
+  });
 }
 
 /**
@@ -271,7 +312,7 @@ async function walkReads(
   context: WalkContext,
   discovered: {
     leaseId?: string;
-    leaseTemplateUuid?: string;
+    leaseTemplates: DiscoveredLeaseTemplate[];
     blueprintId?: string;
   },
 ): Promise<void> {
@@ -307,12 +348,35 @@ async function walkReads(
     { method: "GET", path: "/api/leases" },
   );
 
+  // `userId` and `accessType` are **`required: true`** in the contract
+  // (`docs/openapi/innovation-sandbox-api.json`, `/leases/shared`), and the
+  // generated `ListSharedLeases` UriSpec binds both as query segments.
+  // `HttpBindingMux.match` returns false for a spec whose required query
+  // segments are absent, so a request with no query string does not fail *at*
+  // `ListSharedLeases` — it fails to match that route at all and falls through
+  // to `GetLease` (`/leases/{leaseId}`), which then rejects the literal segment
+  // `shared` as a base64 composite key with
+  // `400 LeaseId path parameter provided is invalid.`
+  //
+  // That is worth stating precisely because it reads exactly like the
+  // route-precedence bug it resembles: an earlier version of this file recorded
+  // it as LocalStack matching `/leases/{leaseId}` before the static path. It is
+  // not. `awslocal apigateway get-resources` shows both resources imported
+  // correctly and in order, and the failing request's Lambda event carries
+  // `"resource": "/leases/shared"` and `"resourceId"` of the *static* resource —
+  // API Gateway routed it right. The application's own mux then failed to match
+  // the operation because the query string was empty. With the two parameters
+  // present the same request returns 200; with only one of them it 400s again,
+  // which is the behaviour of a route that requires both.
+  const sharedLeasesPath = `/api/leases/shared?userId=${encodeURIComponent(
+    LOCAL_IDC_PRINCIPAL_ID,
+  )}&accessType=direct`;
   await runCheck(
     context,
     "leases: GET /api/leases/shared",
     "should-work",
     async () => {
-      const response = await get(token, "/api/leases/shared");
+      const response = await get(token, sharedLeasesPath);
       requireSuccess("leases: GET /api/leases/shared", response);
       const data = dataOf(response);
       if (!Array.isArray(data.result)) {
@@ -320,9 +384,13 @@ async function walkReads(
           `leases: GET /api/leases/shared: no \`data.result\` array; the leases home page reads it. Got ${truncate(response.raw)}`,
         );
       }
-      return `${(data.result as unknown[]).length} shared lease(s); the static path reached ListSharedLeases`;
+      // A list, not a count of one: the point is that the *static* path reached
+      // `ListSharedLeases`. An empty list is the honest result — the seed
+      // assigns no lease to another principal — and asserting non-empty here
+      // would fail on a correct profile.
+      return `${(data.result as unknown[]).length} shared lease(s); the static path with its two required query parameters reached ListSharedLeases, not GetLease`;
     },
-    { method: "GET", path: "/api/leases/shared" },
+    { method: "GET", path: "/api/leases/shared?userId=…&accessType=direct" },
   );
 
   if (discovered.leaseId) {
@@ -359,6 +427,18 @@ async function walkReads(
       },
       { method: "GET", path: `/api/leases/${leaseId}/assignments` },
     );
+  } else {
+    // Reported, not omitted. See `skipCheck`.
+    const why =
+      "no lease is in the Active state, so there is no {leaseId} to read. The `accounts: .../quarantine` boundary check terminates the seeded Active lease, so a second `local:verify` without a `local:reset` lands here.";
+    skipCheck(context, "leases: GET /api/leases/{leaseId}", why, {
+      method: "GET",
+      path: "/api/leases/{leaseId}",
+    });
+    skipCheck(context, "leases: GET /api/leases/{leaseId}/assignments", why, {
+      method: "GET",
+      path: "/api/leases/{leaseId}/assignments",
+    });
   }
 
   // --- leaseTemplates -----------------------------------------------------
@@ -375,16 +455,29 @@ async function walkReads(
         LEASE_TEMPLATE_SCHEMA,
         arrayField(templates, "result"),
       );
-      const first = arrayField(templates, "result")[0] as
-        Record<string, unknown> | undefined;
-      if (first?.uuid) discovered.leaseTemplateUuid = String(first.uuid);
+      // Every template, not just the first. The mutation walk picks one *by
+      // `requiresApproval`*, because the two kinds of template drive different
+      // code paths — the auto-approving one reaches Organizations and Identity
+      // Center, which the local tier does not serve — and `result[0]` made that
+      // choice depend on DynamoDB scan order.
+      discovered.leaseTemplates = (
+        arrayField(templates, "result") as Array<Record<string, unknown>>
+      )
+        .filter((template) => typeof template.uuid === "string")
+        .map((template) => ({
+          uuid: String(template.uuid),
+          name: String(template.name ?? template.uuid),
+          requiresApproval: template.requiresApproval === true,
+        }));
       return detail;
     },
     { method: "GET", path: "/api/leaseTemplates" },
   );
 
-  if (discovered.leaseTemplateUuid) {
-    const uuid = discovered.leaseTemplateUuid;
+  // Any template serves this read; the first is as good as another and this is
+  // a `GET /{id}`, not a flow that branches on the template's own fields.
+  if (discovered.leaseTemplates[0]) {
+    const uuid = discovered.leaseTemplates[0].uuid;
     await runCheck(
       context,
       "leaseTemplates: GET /api/leaseTemplates/{id}",
@@ -403,6 +496,15 @@ async function walkReads(
         return `template ${uuid} matches the production schema`;
       },
       { method: "GET", path: `/api/leaseTemplates/${uuid}` },
+    );
+  } else {
+    // The list check above already failed and said so; this is the consequence,
+    // named rather than left as a hole in the count.
+    skipCheck(
+      context,
+      "leaseTemplates: GET /api/leaseTemplates/{id}",
+      "no lease template was returned by GET /api/leaseTemplates, so there is no {id} to read. The list check above reports why.",
+      { method: "GET", path: "/api/leaseTemplates/{id}" },
     );
   }
 
@@ -443,6 +545,13 @@ async function walkReads(
         return `blueprint ${blueprintId} matches BlueprintItemSchema`;
       },
       { method: "GET", path: `/api/blueprints/${blueprintId}` },
+    );
+  } else {
+    skipCheck(
+      context,
+      "blueprints: GET /api/blueprints/{id}",
+      "no blueprint was returned by GET /api/blueprints, so there is no {id} to read. The list check above reports why.",
+      { method: "GET", path: "/api/blueprints/{id}" },
     );
   }
 
@@ -590,7 +699,11 @@ async function walkReads(
  */
 async function walkMutations(
   context: WalkContext,
-  discovered: { leaseTemplateUuid?: string; blueprintId?: string },
+  discovered: {
+    leaseId?: string;
+    leaseTemplates: DiscoveredLeaseTemplate[];
+    blueprintId?: string;
+  },
 ): Promise<void> {
   const { token } = context;
   const stamp = Date.now().toString(36);
@@ -729,69 +842,228 @@ async function walkMutations(
     );
   }
 
-  // --- leases: request, then patch ----------------------------------------
-  if (discovered.leaseTemplateUuid) {
-    const templateUuid = discovered.leaseTemplateUuid;
-    let requestedLeaseId: string | undefined;
-    await runCheck(
-      context,
-      "leases: POST /api/leases (request)",
-      "should-work",
-      async () => {
-        const response = await send(token, "POST", "/api/leases", {
-          leaseTemplateUuid: templateUuid,
-          comments: `requested by local:verify at ${stamp}`,
-        });
-        requireSuccess("leases: POST /api/leases", response, [200, 201]);
-        const data = dataOf(response);
-        const lease = (data.lease ?? data) as Record<string, unknown>;
-        validate("leases: request response", LEASE_SCHEMA, lease);
-        const uuid = String(lease.uuid ?? "");
-        const leases = await get(token, "/api/leases");
-        requireSuccess("leases: GET after request", leases);
-        const found = (
-          arrayField(leases, "result") as Array<Record<string, unknown>>
-        ).find((entry) => entry.uuid === uuid);
-        if (!found) {
-          throw new Error(
-            `leases: POST returned 200 for ${uuid} but the list does not contain it. The write did not reach DynamoDB.`,
-          );
-        }
-        requestedLeaseId = found.leaseId as string | undefined;
-        return `created ${uuid} and confirmed it in GET /api/leases`;
-      },
-      { method: "POST", path: "/api/leases" },
+  // --- leases: request, then review, then patch ----------------------------
+  //
+  // Two things are separated here that the walk previously ran together, and
+  // the separation is the fix rather than a convenience.
+  //
+  // **The template is chosen by `requiresApproval`, not by list position.**
+  // The seed ships one of each, and the old code took `result[0]` — which is
+  // whichever the DynamoDB scan happened to return first, so the check silently
+  // depended on scan order. On a clean profile that was the *auto-approving*
+  // template, whose flow calls `IdcService.getUserFromEmail` and therefore
+  // `identitystore: GetUserId`/`DescribeUser` — a service the LocalStack
+  // Community (Hobby) tier does not serve, so the check failed at a boundary
+  // rather than at anything in `local/`. The approval-*required* template's
+  // request path is DynamoDB plus EventBridge, both of which LocalStack serves,
+  // and it returns 201. That is the flow this check is for; the auto-approving
+  // one is asserted as a boundary in `walkBoundaries`, which is where the
+  // design's "Lease request, approval — No" row actually belongs.
+  if (discovered.leaseTemplates.length) {
+    const templates = discovered.leaseTemplates;
+    const requiresApproval = templates.find(
+      (template) => template.requiresApproval,
     );
-
-    if (requestedLeaseId) {
-      const leaseId = requestedLeaseId;
+    const autoApproves = templates.find(
+      (template) => !template.requiresApproval,
+    );
+    if (!requiresApproval) {
       await runCheck(
         context,
-        "leases: PATCH /api/leases/{leaseId} (update)",
+        "leases: POST /api/leases (request)",
         "should-work",
         async () => {
-          const response = await send(
-            token,
-            "PATCH",
-            `/api/leases/${leaseId}`,
-            {
-              maxSpend: 9,
-              comments: `patched by local:verify at ${stamp}`,
-            },
+          throw new Error(
+            `no seeded lease template has \`requiresApproval: true\` (found ${templates.map((template) => `${template.name}=${String(template.requiresApproval)}`).join(", ")}), so the request path that does not need Identity Center cannot be exercised`,
           );
-          requireSuccess("leases: PATCH /api/leases/{leaseId}", response);
+        },
+        { method: "POST", path: "/api/leases" },
+      );
+      skipCheck(
+        context,
+        "leases: POST /api/leases/{leaseId}/review (deny, cleanup)",
+        "no lease was created, so there is nothing to deny. The request check above reports why.",
+        { method: "POST", path: "/api/leases/{leaseId}/review" },
+      );
+    } else {
+      const templateUuid = requiresApproval.uuid;
+      let requestedLeaseId: string | undefined;
+      await runCheck(
+        context,
+        "leases: POST /api/leases (request)",
+        "should-work",
+        async () => {
+          const response = await send(token, "POST", "/api/leases", {
+            leaseTemplateUuid: templateUuid,
+            comments: `requested by local:verify at ${stamp}`,
+          });
+          requireSuccess("leases: POST /api/leases", response, [200, 201]);
           const data = dataOf(response);
           const lease = (data.lease ?? data) as Record<string, unknown>;
-          if (lease.maxSpend !== 9) {
+          validate("leases: request response", LEASE_SCHEMA, lease);
+          // The request path must leave the lease *pending*, not approved.
+          // Asserted because an auto-approved lease means the request took the
+          // `approveLease` branch, which reaches Organizations and Identity
+          // Center — so a profile where that succeeded would be reporting a
+          // boundary leak as a pass.
+          if (lease.status !== "PendingApproval") {
             throw new Error(
-              `leases: the patch returned 200 but maxSpend is ${JSON.stringify(lease.maxSpend)}, not 9`,
+              `leases: the request came back with status ${JSON.stringify(lease.status)}, not PendingApproval, so it went through approveLease rather than the approval queue`,
             );
           }
-          return "maxSpend updated to 9 in the response";
+          const uuid = String(lease.uuid ?? "");
+          const leases = await get(token, "/api/leases");
+          requireSuccess("leases: GET after request", leases);
+          const found = (
+            arrayField(leases, "result") as Array<Record<string, unknown>>
+          ).find((entry) => entry.uuid === uuid);
+          if (!found) {
+            throw new Error(
+              `leases: POST returned 200 for ${uuid} but the list does not contain it. The write did not reach DynamoDB.`,
+            );
+          }
+          requestedLeaseId = found.leaseId as string | undefined;
+          return `created ${uuid} as PendingApproval from ${requiresApproval.name} and confirmed it in GET /api/leases`;
         },
-        { method: "PATCH", path: `/api/leases/${leaseId}` },
+        { method: "POST", path: "/api/leases" },
+      );
+
+      // **Deny the lease the walk just made.** Not cosmetic: `requestLease`
+      // counts leases in `["Active", "PendingApproval", "Frozen",
+      // "Provisioning"]` against `globalConfig.leases.maxLeasesPerUser` (3 by
+      // default), and the seed already ships one PendingApproval and one Active.
+      // Without this step a second `local:verify` on the same profile 409s with
+      // "maximum number of active/pending leases allowed" — the walk would only
+      // ever pass once per `local:up`, which is the kind of thing that reads as
+      // a flaky profile rather than a leak in the walk. `Deny` is pure
+      // DynamoDB plus an EventBridge event, and it moves the lease to
+      // `ApprovalDenied`, which is outside the counted set.
+      if (requestedLeaseId) {
+        const leaseId = requestedLeaseId;
+        await runCheck(
+          context,
+          "leases: POST /api/leases/{leaseId}/review (deny, cleanup)",
+          "should-work",
+          async () => {
+            const response = await send(
+              token,
+              "POST",
+              `/api/leases/${leaseId}/review`,
+              { action: "Deny" },
+            );
+            requireSuccess("leases: review Deny", response);
+            const leases = await get(token, "/api/leases");
+            requireSuccess("leases: GET after review", leases);
+            const found = (
+              arrayField(leases, "result") as Array<Record<string, unknown>>
+            ).find((entry) => entry.leaseId === leaseId);
+            if (found?.status !== "ApprovalDenied") {
+              throw new Error(
+                `leases: review Deny returned 200 but the lease reads back as ${JSON.stringify(found?.status)}, not ApprovalDenied. The write did not reach DynamoDB.`,
+              );
+            }
+            return "denied, and confirmed ApprovalDenied on read; the lease slot is released so the next run can request again";
+          },
+          { method: "POST", path: `/api/leases/${leaseId}/review` },
+        );
+      } else {
+        // The request check above already reported the failure; this is its
+        // consequence. Reported so the run does not silently shrink.
+        skipCheck(
+          context,
+          "leases: POST /api/leases/{leaseId}/review (deny, cleanup)",
+          "no lease was created, so there is nothing to deny. The request check above reports why.",
+          { method: "POST", path: "/api/leases/{leaseId}/review" },
+        );
+      }
+    }
+
+    // Carried out of the branch above so the boundary list can name the
+    // auto-approving template the walk deliberately did *not* use.
+    context.autoApprovingTemplate = autoApproves;
+  } else {
+    // No templates at all. The list check above reports the empty list; these
+    // are its consequences, named rather than dropped from the count.
+    for (const [name, path] of [
+      ["leases: POST /api/leases (request)", "/api/leases"],
+      [
+        "leases: POST /api/leases/{leaseId}/review (deny, cleanup)",
+        "/api/leases/{leaseId}/review",
+      ],
+    ] as const) {
+      skipCheck(
+        context,
+        name,
+        "no lease template was returned by GET /api/leaseTemplates, so there is nothing to request from. The list check above reports why.",
+        { method: "POST", path },
       );
     }
+  }
+
+  // The PATCH targets the seeded **Active** lease, not the one the walk just
+  // created. Two reasons, both of which were failures:
+  //
+  //   - `updateLease` calls `isMonitoredLease(existingLease)` and 400s with
+  //     "Can only update an active lease" on anything else, so patching the
+  //     freshly-requested PendingApproval lease could never have worked.
+  //   - `UpdateLeaseRequestContent` does not model `comments`. The retained Zod
+  //     supplement is `.strict()`, so the old body — which sent `comments` — was
+  //     rejected with `400 Unrecognized key: "comments"` before the handler ran.
+  //     The contract's own members are `maxSpend`, `budgetThresholds`,
+  //     `expirationDate`, `durationThresholds`, `costReportGroup`, and
+  //     `allowOwnerToShareLease`; only `maxSpend` is sent.
+  if (discovered.leaseId) {
+    const leaseId = discovered.leaseId;
+    await runCheck(
+      context,
+      "leases: PATCH /api/leases/{leaseId} (update)",
+      "should-work",
+      async () => {
+        const before = await get(token, `/api/leases/${leaseId}`);
+        requireSuccess("leases: GET before PATCH", before);
+        const existing = dataMaybe(before) as Record<string, unknown>;
+        const originalSpend = existing.maxSpend;
+        const patched = await send(token, "PATCH", `/api/leases/${leaseId}`, {
+          maxSpend: 9,
+        });
+        requireSuccess("leases: PATCH /api/leases/{leaseId}", patched);
+        const data = dataOf(patched);
+        const lease = (data.lease ?? data) as Record<string, unknown>;
+        if (lease.maxSpend !== 9) {
+          throw new Error(
+            `leases: the patch returned 200 but maxSpend is ${JSON.stringify(lease.maxSpend)}, not 9`,
+          );
+        }
+        // Read it back rather than trusting the response body: a write that
+        // returns 200 and does not reach DynamoDB is exactly what this check
+        // exists to catch, and the response echo would not show it.
+        const readBack = await get(token, `/api/leases/${leaseId}`);
+        requireSuccess("leases: GET after PATCH", readBack);
+        if (dataMaybe(readBack).maxSpend !== 9) {
+          throw new Error(
+            `leases: the patch returned 200 but the read shows maxSpend=${JSON.stringify(dataMaybe(readBack).maxSpend)}, not 9. The write did not reach DynamoDB.`,
+          );
+        }
+        // Put it back, so a `local:verify` run leaves the seed as it found it.
+        if (originalSpend !== undefined) {
+          requireSuccess(
+            "leases: PATCH restore",
+            await send(token, "PATCH", `/api/leases/${leaseId}`, {
+              maxSpend: originalSpend,
+            }),
+          );
+        }
+        return `changed maxSpend ${String(originalSpend)} -> 9 -> ${String(originalSpend)} on the seeded Active lease, confirmed on read`;
+      },
+      { method: "PATCH", path: `/api/leases/${leaseId}` },
+    );
+  } else {
+    skipCheck(
+      context,
+      "leases: PATCH /api/leases/{leaseId} (update)",
+      'no lease is in the Active state, so there is nothing to update — `updateLease` 400s with "Can only update an active lease" for every other status. The `accounts: .../quarantine` boundary check terminates the seeded Active lease, so a second `local:verify` without a `local:reset` lands here.',
+      { method: "PATCH", path: "/api/leases/{leaseId}" },
+    );
   }
 
   // --- configurations: round-trip a section -------------------------------
@@ -894,8 +1166,22 @@ interface Boundary {
  *     before it writes anything, so creation needs CloudFormation StackSets.
  *   - `retryCleanup` and `skipCooldown` sit behind account-state preconditions
  *     the fixtures cannot satisfy, so they 409 long before Organizations.
+ *
+ * `leasesAutoApproval` is the fourth: the design's table lists "Lease request,
+ * approval — the IDC config SSM parameter — No". The parameter now exists, and
+ * the *request* half of that row works — `POST /leases` against a template with
+ * `requiresApproval: true` returns 201 and is asserted as a working mutation.
+ * The *approval* half does not, and for a different reason than the design
+ * gives: `approveLease` runs `IdcService.getUserFromEmail`, which calls
+ * `identitystore: GetUserId` and `DescribeUser`. That is not in the LocalStack
+ * Community (Hobby) tier, so the failure is a licence boundary rather than a
+ * missing parameter. Checking it as a boundary is what makes that distinction
+ * visible instead of leaving it to be rediscovered as a mysterious 500.
  */
-function boundaryChecks(): Boundary[] {
+function boundaryChecks(leasesAutoApproval?: {
+  uuid: string;
+  name: string;
+}): Boundary[] {
   const active = "/api/accounts/111111111111";
   return [
     {
@@ -952,11 +1238,32 @@ function boundaryChecks(): Boundary[] {
       // blueprint needs StackSets even though the write itself is DynamoDB.
       service: "cloudformation",
     },
+    // Conditional on the seed: a profile whose templates are all
+    // `requiresApproval: true` has no auto-approving path to check, and a
+    // boundary check that quietly disappears is worse than one that is absent.
+    // The caller reports that case rather than it passing vacuously.
+    ...(leasesAutoApproval
+      ? [
+          {
+            name: `leases: POST /api/leases on an auto-approving template (${leasesAutoApproval.name}) reaches Identity Center`,
+            method: "POST",
+            path: "/api/leases",
+            body: {
+              leaseTemplateUuid: leasesAutoApproval.uuid,
+              comments: "requested by local:verify boundary check",
+            },
+            // `approveLease` resolves the assignee with
+            // `IdcService.getUserFromEmail` -> `identitystore: GetUserId`, which
+            // the Community tier does not serve.
+            service: "identitystore",
+          },
+        ]
+      : []),
   ];
 }
 
 async function walkBoundaries(context: WalkContext): Promise<void> {
-  for (const boundary of boundaryChecks()) {
+  for (const boundary of boundaryChecks(context.autoApprovingTemplate)) {
     await runCheck(
       context,
       boundary.name,
@@ -1007,11 +1314,23 @@ async function walkBoundaries(context: WalkContext): Promise<void> {
 // The walk
 // ---------------------------------------------------------------------------
 
+/** The lease template facts the walk branches on, taken from the seeded list. */
+export interface DiscoveredLeaseTemplate {
+  uuid: string;
+  name: string;
+  requiresApproval: boolean;
+}
+
 export interface WalkOutcome {
   results: VerifyResult[];
   discovered: {
+    /** The seeded Active lease, captured by the read walk. */
     leaseId?: string;
-    leaseTemplateUuid?: string;
+    /**
+     * Every seeded template, so the mutation walk can pick by
+     * `requiresApproval` rather than by list position.
+     */
+    leaseTemplates: DiscoveredLeaseTemplate[];
     blueprintId?: string;
   };
 }
@@ -1028,8 +1347,16 @@ export async function walkApi(
       retryDelayMs: options.retryDelayMs ?? 750,
     },
     results: [],
+    /**
+     * Set by the mutation walk, read by the boundary walk. Carried on the
+     * context rather than recomputed so there is one place that decides which
+     * template drives the request mutation and which drives the auto-approval
+     * boundary — two decisions that have to disagree, and would not if each were
+     * re-derived.
+     */
+    autoApprovingTemplate: undefined,
   };
-  const discovered: WalkOutcome["discovered"] = {};
+  const discovered: WalkOutcome["discovered"] = { leaseTemplates: [] };
 
   await walkReads(context, discovered);
   await walkMutations(context, discovered);

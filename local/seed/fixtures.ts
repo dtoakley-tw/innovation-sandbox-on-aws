@@ -78,6 +78,17 @@ export const ADMIN_EMAIL = "admin@example.local";
  */
 export const DISTANT_FUTURE_TTL = 4_102_444_800;
 
+/**
+ * The cost report group the seeded templates and leases carry, and the one
+ * entry in the seeded `costReporting.costReportGroups`.
+ *
+ * One constant for both sides, because `validateCostReportGroup` rejects a
+ * `costReportGroup` that is not a member of the configured list — checked on
+ * create and on update — and two literals would let the seed drift into the
+ * state where its own API refuses its own records. See `buildConfigSections`.
+ */
+export const LOCAL_COST_REPORT_GROUP = "local";
+
 export interface SeedFixtures {
   accounts: PersistedSandboxAccount[];
   leaseTemplates: PersistedLeaseTemplate[];
@@ -165,7 +176,7 @@ const LEASE_TEMPLATES = [
     budgetThresholds: [{ dollarsSpent: 20, action: "ALERT" }],
     leaseDurationInHours: 24,
     durationThresholds: [{ hoursRemaining: 4, action: "ALERT" }],
-    costReportGroup: "local",
+    costReportGroup: LOCAL_COST_REPORT_GROUP,
   },
   {
     uuid: "0ccc0000-0000-4000-8000-000000000002",
@@ -315,15 +326,69 @@ export function buildSeedFixtures(): SeedFixtures {
     blueprints,
     principals,
     leases: [pendingLease, activeLease, expiredLease],
-    // The code defaults are exactly what `isbConfigMiddleware` falls back to for
-    // an absent section, so a seeded LocalStack and a fresh deployment hand the
-    // application the same configuration. Deriving rather than hand-writing
-    // means an upstream field change breaks here, not in the browser.
-    configSections: Object.fromEntries(
-      (Object.keys(ConfigSchemas) as ConfigSection[]).map((section) => [
-        section,
-        ConfigSchemas[section].parse({}),
-      ]),
-    ) as SeedFixtures["configSections"],
+    configSections: buildConfigSections(),
   };
+}
+
+/**
+ * The six configuration sections, derived from `ConfigSchemas` so an upstream
+ * field change breaks here rather than in a browser — with two deliberate
+ * departures from the pure code defaults, both of which exist to make the seed
+ * *self-consistent*.
+ *
+ * **Why not just the defaults.** `ConfigSchemas[section].parse({})` is what
+ * `isbConfigMiddleware` falls back to for an absent section, so defaults alone
+ * would hand a seeded LocalStack the same configuration as a fresh deployment.
+ * But the records above are not default-shaped: `local-standard-lease` and the
+ * Active and Expired leases carry `allowOwnerToShareLease: true` and
+ * `costReportGroup: "local"`, and `validateLeaseCompliesWithGlobalConfig` /
+ * `validateCostReportGroup` reject exactly those under the defaults. Observed
+ * directly, against a profile seeded with the defaults:
+ *
+ * ```
+ * POST /api/leaseTemplates   (the seeded template verbatim)
+ *   -> 400 "Cannot enable allowOwnerToShareLease because lease sharing is not available."
+ * PATCH /api/leases/{id}     (any field, on the seeded Active lease)
+ *   -> 400 "Cannot enable allowOwnerToShareLease because lease sharing is not available."
+ *   -> 400 "Invalid cost report group"   (once sharing is enabled)
+ * ```
+ *
+ * So the profile shipped records its own API refuses to create, and every write
+ * to a seeded lease or template was rejected before the handler did any work. A
+ * developer would read that as a broken profile rather than as a fixture that
+ * disagrees with itself.
+ *
+ * **Why these two values.** `leaseSharingEnabled: true` is what makes
+ * `allowOwnerToShareLease` on the seeded template and leases a legal value, and
+ * the shared-leases view — which the leases home page issues on every load —
+ * needs a lease that can be shared to have anything to show.
+ * `costReportGroups: ["local"]` makes the seeded `costReportGroup` a member of
+ * the allowed set; `validateCostReportGroup` checks membership whenever the
+ * field is set, on create and on update alike.
+ *
+ * Everything else stays at the code default, so this is two fields rather than
+ * a hand-written configuration that would drift from the schemas.
+ */
+function buildConfigSections(): SeedFixtures["configSections"] {
+  const sections = Object.fromEntries(
+    (Object.keys(ConfigSchemas) as ConfigSection[]).map((section) => [
+      section,
+      ConfigSchemas[section].parse({}),
+    ]),
+  ) as Record<ConfigSection, ConfigSectionFields<ConfigSection>>;
+
+  const leases = sections.leases as ConfigSectionFields<"leases">;
+  sections.leases = {
+    ...leases,
+    leaseSharingEnabled: true,
+  } as ConfigSectionFields<ConfigSection>;
+
+  const costReporting =
+    sections.costReporting as ConfigSectionFields<"costReporting">;
+  sections.costReporting = {
+    ...costReporting,
+    costReportGroups: [LOCAL_COST_REPORT_GROUP],
+  } as ConfigSectionFields<ConfigSection>;
+
+  return sections as SeedFixtures["configSections"];
 }

@@ -105,11 +105,16 @@ export function formatReport(report: VerifyReport): string {
     lines.push(`${colour}${title}${RESET}`);
 
   const worked = report.results.filter(
-    (result) => result.ok && result.expectation === "should-work",
+    (result) =>
+      result.ok && result.expectation === "should-work" && !result.skipped,
   );
   const broke = report.results.filter(
     (result) => !result.ok && result.expectation === "should-work",
   );
+  // Kept out of `worked` so a skipped check can never be counted as a pass. The
+  // count of checks still includes them, so the two numbers together always add
+  // up to what ran plus what was dropped.
+  const skipped = report.results.filter((result) => result.skipped);
   const boundariesHeld = report.results.filter(
     (result) =>
       !result.ok &&
@@ -138,6 +143,13 @@ export function formatReport(report: VerifyReport): string {
     );
     report.undetermined.forEach(line);
   }
+  if (skipped.length) {
+    header(
+      `skipped (${skipped.length}) — a check that depends on state an earlier check consumed. Not a pass, and not a failure either; \`npm run local:reset\` puts the profile back:`,
+      YELLOW,
+    );
+    skipped.forEach(line);
+  }
   if (boundariesHeld.length) {
     header(
       `held as designed (${boundariesHeld.length}) — failed at the real AWS call, not a synthetic refusal:`,
@@ -165,6 +177,7 @@ export function formatReport(report: VerifyReport): string {
   lines.push(
     `${clean ? GREEN : RED}` +
       `${report.results.length} checks: ${worked.length} passed, ${report.failures.length} failed, ` +
+      `${skipped.length} skipped, ` +
       `${boundariesHeld.length} boundaries held, ${report.brokenBoundaries.length} boundary leaks, ` +
       `${report.undetermined.length} undetermined, ${report.retried.length} needed a retry.${RESET}`,
   );

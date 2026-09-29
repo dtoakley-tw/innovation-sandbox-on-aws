@@ -27,6 +27,11 @@ import {
   DISTANT_FUTURE_TTL,
   SEED_TIME,
 } from "./fixtures.js";
+import {
+  buildSsmParameters,
+  createLocalSsmClient,
+  seedSsmParameters,
+} from "./ssm-parameters.js";
 
 /**
  * Where the schema-derived fixtures stop and the store's addressing begins.
@@ -50,6 +55,13 @@ export interface SeedSummary {
   principals: number;
   leases: number;
   configSections: number;
+  /**
+   * SSM parameters written, which is always two. Counted rather than assumed so
+   * the printed summary would show a drop if a parameter were ever removed from
+   * `buildSsmParameters` — the absence is precisely what this module exists to
+   * stop happening silently.
+   */
+  ssmParameters: number;
 }
 
 export interface SeedOptions {
@@ -138,7 +150,10 @@ export function buildSeedWrites(): SeedWrite[] {
 }
 
 /** Counts what the seed wrote, one entry per domain the fixtures cover. */
-export function summarizeWrites(writes: SeedWrite[]): SeedSummary {
+export function summarizeWrites(
+  writes: SeedWrite[],
+  ssmParameters = 0,
+): SeedSummary {
   const count = (table: LocalTableName) =>
     writes.filter((write) => write.table === table).length;
   return {
@@ -148,6 +163,7 @@ export function summarizeWrites(writes: SeedWrite[]): SeedSummary {
     principals: count("principal"),
     leases: count("lease"),
     configSections: count("config"),
+    ssmParameters,
   };
 }
 
@@ -164,17 +180,26 @@ export function createLocalDocumentClient(options: SeedOptions = {}) {
 }
 
 /**
- * Writes the fixture set into LocalStack. Idempotent: every write is an
- * unconditional `PutCommand` keyed by the record's own identifier, so re-running
- * after a partial deep-flow failure restores a known-good state without dropping
- * the tables. This is the documented remedy for the partial writes that the
- * unsupported services can leave behind.
+ * Writes the fixture set into LocalStack. Idempotent: every DynamoDB write is an
+ * unconditional `PutCommand` keyed by the record's own identifier and every SSM
+ * write is a `PutParameter` with `Overwrite`, so re-running after a partial
+ * deep-flow failure — or after a `cdk deploy` that dropped a parameter — restores
+ * a known-good state without dropping the tables. This is the documented remedy
+ * for the partial writes that the unsupported services can leave behind.
+ *
+ * The SSM parameters go first. They are read by configuration the handler
+ * assembles before it looks at any request body, so a missing one turns every
+ * affected domain into a bare 500 with a `GetParameterError` in the log, and
+ * writing them after the tables would widen that window.
  */
 export async function seedLocalEnvironment(
   options: SeedOptions = {},
 ): Promise<SeedSummary> {
   const writes = buildSeedWrites();
   const client = createLocalDocumentClient(options);
+  const ssmParameters = buildSsmParameters();
+
+  await seedSsmParameters(createLocalSsmClient(options), ssmParameters);
 
   // Unconditional puts, one item at a time. `BatchWriteCommand` would be faster
   // but rejects duplicate keys within a batch, and re-running the seed must
@@ -185,7 +210,7 @@ export async function seedLocalEnvironment(
     );
   }
 
-  return summarizeWrites(writes);
+  return summarizeWrites(writes, ssmParameters.length);
 }
 
 // Only when invoked as a script. `seed.test.ts` imports this module, and

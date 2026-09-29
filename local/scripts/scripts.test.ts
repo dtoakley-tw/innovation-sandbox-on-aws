@@ -722,6 +722,89 @@ exit $status`,
     expect(down).toMatch(/rm -rf .*local\/cdk\.out/);
   });
 
+  // `local:down` used to abort on `set -euo pipefail` when `docker compose down`
+  // hit "Network isb-local Resource is still in use" — which is exactly what
+  // happens after LocalStack's gateway dies mid-walk and orphans the Lambda
+  // containers it started — leaving a stale `cdk.out` behind. `local-up.sh` then
+  // reads that stale file for the API Gateway id, so the failure surfaced one
+  // whole command later as an edge pointed at an API that did not exist.
+  //
+  // Both halves are asserted: the orphans are removed *first* (so compose can
+  // take the network), and the `rm -rf` runs *last and unconditionally*.
+  describe("tearing down when LocalStack has orphaned Lambda containers", () => {
+    it("removes the orphans before compose tries to take the network", () => {
+      const down = read("scripts/local-down.sh");
+      const sweep = down.indexOf("remove_orphaned_lambdas\n");
+      const compose = down.search(/^docker compose .*\bdown\b/m);
+      expect(sweep).toBeGreaterThan(-1);
+      expect(compose).toBeGreaterThan(-1);
+      expect(sweep).toBeLessThan(compose);
+    });
+
+    it("only sweeps containers on the profile's own network and the Lambda image", () => {
+      // A `docker rm -f $(docker ps -aq)` with no filters would remove whatever
+      // else the developer is running. Both filters are required: the network is
+      // what the orphans are holding, and the image is what distinguishes a
+      // Lambda container from a compose-managed one.
+      const body = bashFunction(
+        read("scripts/local-down.sh"),
+        "remove_orphaned_lambdas",
+      );
+      expect(body).toContain("--filter");
+      expect(body).toMatch(/network=\$network/);
+      expect(body).toMatch(/ancestor=public\.ecr\.aws\/lambda\/nodejs:24/);
+      // `-a`, not the default: a stopped container still holds the network, and
+      // the orphans are frequently already exited.
+      expect(body).toMatch(/docker ps -aq/);
+    });
+
+    it("sweeps the network the compose file declares, not a restated one", () => {
+      // `isb-local` is a literal in the script, for the same reason the port and
+      // account id are in local-up.sh: bash cannot import a TypeScript constant.
+      // The cross-check is the test — a rename in compose.yaml fails here rather
+      // than leaving the script sweeping nothing. `LAMBDA_DOCKER_NETWORK` on the
+      // localstack service is what LocalStack itself attaches them to, so that is
+      // the value the sweep has to agree with.
+      const down = read("scripts/local-down.sh");
+      expect(down).toMatch(/^network="isb-local"$/m);
+      const lambdaNetwork = composeService("localstack").match(
+        /LAMBDA_DOCKER_NETWORK:\s*"?([^"\n]+)"?/,
+      )?.[1];
+      expect(lambdaNetwork).toBe("isb-local");
+      expect(declaredNetworkName(lambdaNetwork as string)).toBe(
+        lambdaNetwork as string,
+      );
+    });
+
+    it("does not let a compose failure skip the cdk.out removal", () => {
+      // The `|| echo` rather than a bare command: under `set -e` a failing
+      // `docker compose down` ends the script, and everything after it — which
+      // is the `rm -rf` that is the whole point of the check above — never runs.
+      const down = read("scripts/local-down.sh");
+      const compose = down.search(/^docker compose .*\bdown\b/m);
+      // `lastIndexOf`, not `indexOf`: the file *comments* the `rm -rf` it
+      // explains, and an `indexOf` resolved to that prose and compared it
+      // against the compose call — the same mistake the "restarts the edge only
+      // after the id is known" test documents. The comparison has to be against
+      // the command, not a mention of it.
+      const rm = down.lastIndexOf('rm -rf "$root/local/cdk.out"');
+      expect(compose).toBeGreaterThan(-1);
+      expect(rm).toBeGreaterThan(compose);
+      // Anchored to the guard itself, not to the word "||" appearing anywhere:
+      // the compose invocation and the continuation have to be one statement.
+      expect(down).toMatch(
+        /^docker compose .*\bdown\b[^\n]*\|\| \\?\n?\s*echo /m,
+      );
+    });
+
+    it("still ends with the unconditional cdk.out removal", () => {
+      // Anchored to the end of the file, so nothing can be appended after it and
+      // become a step that a future failure could skip.
+      const down = read("scripts/local-down.sh").trimEnd();
+      expect(down.endsWith('rm -rf "$root/local/cdk.out"')).toBe(true);
+    });
+  });
+
   it("resets by tearing down before bringing the profile back up", () => {
     const reset = read("scripts/local-reset.sh");
     expect(reset).toMatch(/bash "\$here\/local-down\.sh"/);

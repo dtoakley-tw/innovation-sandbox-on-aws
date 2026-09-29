@@ -24,6 +24,17 @@ export interface VerifyResult {
    */
   detail: string;
   expectation: Expectation;
+  /**
+   * A check that could not run, because something it depends on was consumed by
+   * an earlier check — reported so the count is honest.
+   *
+   * `ok` is `true` because a skip is not a defect, and it does not count towards
+   * `failures`, so it does not set the exit code. It is *not* counted as a pass
+   * either: `formatReport` puts skips in their own group for exactly that
+   * reason. The alternative — omitting the result — makes a run that did less
+   * work look like a run that had fewer problems.
+   */
+  skipped?: boolean;
   /** The request that produced it, for reproducing a failure by hand. */
   request?: string;
   /**

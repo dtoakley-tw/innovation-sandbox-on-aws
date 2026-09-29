@@ -195,17 +195,89 @@ describe("seed fixtures", () => {
     }
   });
 
+  // Two of the six sections differ from the code defaults, and both departures
+  // exist so the seed agrees with *itself*: `buildConfigSections` explains why,
+  // and the check here is that nothing else has drifted. Asserted as an explicit
+  // allow-list of overrides rather than as a blanket equality, because a blanket
+  // equality is what let the seed ship records its own API refuses to create —
+  // every seeded template and lease carried `allowOwnerToShareLease: true` and
+  // `costReportGroup: "local"` while the configuration forbade both, so every
+  // write to a seeded record 400'd before the handler ran.
   it("derives every configuration section from the production defaults", () => {
     const sections = Object.keys(ConfigSchemas) as ConfigSection[];
     expect(Object.keys(fixtures.configSections).sort()).toEqual(
       sections.sort(),
     );
+    // The only two sections that may differ, and the only field in each.
+    const OVERRIDES: Partial<Record<ConfigSection, string[]>> = {
+      leases: ["leaseSharingEnabled"],
+      costReporting: ["costReportGroups"],
+    };
     for (const section of sections) {
-      // Equal to the defaults the Lambda middleware falls back to for an absent
-      // section, so the local environment and a fresh deployment agree.
-      expect(fixtures.configSections[section]).toEqual(
-        ConfigSchemas[section].parse({}),
-      );
+      const defaults = ConfigSchemas[section].parse({}) as Record<
+        string,
+        unknown
+      >;
+      const actual = fixtures.configSections[section] as Record<
+        string,
+        unknown
+      >;
+      // Same key set as the defaults, so an upstream section that gains a field
+      // still arrives here through `ConfigSchemas[section].parse({})` rather
+      // than being silently absent from the seed.
+      expect(Object.keys(actual).sort()).toEqual(Object.keys(defaults).sort());
+      const overridden = OVERRIDES[section] ?? [];
+      for (const [key, value] of Object.entries(defaults)) {
+        if (overridden.includes(key)) continue;
+        expect(actual[key], `${section}.${key}`).toEqual(value);
+      }
+    }
+  });
+
+  // The two overrides are not free choices: each one makes a field the seed's
+  // own records already use legal, and the API rejects them otherwise. Observed
+  // against a profile seeded with the pure defaults:
+  //   POST /api/leaseTemplates (the seeded template verbatim)
+  //     -> 400 "Cannot enable allowOwnerToShareLease because lease sharing is
+  //            not available."
+  //   PATCH /api/leases/{id} -> 400 "Invalid cost report group"
+  it("seeds a configuration its own lease and template records are legal under", () => {
+    const leases = fixtures.configSections.leases as {
+      leaseSharingEnabled: boolean;
+    };
+    const costReporting = fixtures.configSections.costReporting as {
+      costReportGroups: string[];
+    };
+    // `validateLeaseSharingEnabled` rejects any lease or template with
+    // `allowOwnerToShareLease: true` while the flag is off.
+    expect(leases.leaseSharingEnabled).toBe(true);
+    for (const template of fixtures.leaseTemplates) {
+      if (template.allowOwnerToShareLease) {
+        expect(leases.leaseSharingEnabled, template.name).toBe(true);
+      }
+    }
+    for (const lease of fixtures.leases) {
+      if (lease.allowOwnerToShareLease) {
+        expect(leases.leaseSharingEnabled, lease.uuid).toBe(true);
+      }
+    }
+    // `validateCostReportGroup` checks membership whenever the field is set,
+    // on create and on update alike.
+    for (const template of fixtures.leaseTemplates) {
+      if (template.costReportGroup !== undefined) {
+        expect(
+          costReporting.costReportGroups,
+          `${template.name}.costReportGroup=${template.costReportGroup}`,
+        ).toContain(template.costReportGroup);
+      }
+    }
+    for (const lease of fixtures.leases) {
+      if (lease.costReportGroup !== undefined) {
+        expect(
+          costReporting.costReportGroups,
+          `${lease.uuid}.costReportGroup=${lease.costReportGroup}`,
+        ).toContain(lease.costReportGroup);
+      }
     }
   });
 
