@@ -6,9 +6,24 @@ import { ConfigurationLambdaEnvironmentSchema } from "@amzn/innovation-sandbox-c
 import { LeaseLambdaEnvironmentSchema } from "@amzn/innovation-sandbox-commons/lambda/environments/lease-lambda-environment.js";
 import { LeaseTemplateLambdaEnvironmentSchema } from "@amzn/innovation-sandbox-commons/lambda/environments/lease-template-lambda-environment.js";
 import { PrincipalsLambdaEnvironmentSchema } from "@amzn/innovation-sandbox-commons/lambda/environments/principals-lambda-environment.js";
+import { X509Certificate } from "node:crypto";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
-import { localTableNames } from "../../shared/names.js";
+import {
+  loadOrCreateDevTlsCredentials,
+  LOCAL_CA_CERTIFICATE_FILENAME,
+  LOCAL_CA_CERTIFICATE_IN_TASK_ROOT,
+  localCaCertificatePath,
+} from "../../edge/dev-ca.js";
+import {
+  LOCAL_EDGE_SERVICE_NAME,
+  LOCAL_EDGE_TLS_PORT,
+  LOCAL_JWKS_PATH,
+  localTableNames,
+} from "../../shared/names.js";
 import {
   buildLocalEnv,
   LOCAL_JWKS_URI,
@@ -64,10 +79,100 @@ describe("buildLocalEnv", () => {
     expect(env.SOME_FUTURE_VARIABLE).toBe("yes");
   });
 
-  it("sets ISB_LOCAL_JWKS_URI to the in-network edge address", () => {
+  // `aws-jwt-verify@4.0.1` fetches the JWKS with `node:https.request` and has no
+  // code path down to plain `http:` — on an `http://` URI it throws
+  // ERR_INVALID_PROTOCOL before a packet is sent, so every authenticated request
+  // failed at key retrieval. An `http` here is a 500 in every Lambda, and the
+  // only symptom is a JWKS error behind an "Invalid identity token".
+  it("sets ISB_LOCAL_JWKS_URI to the in-network edge address, over TLS", () => {
     const env = buildLocalEnv(LeaseTemplateLambdaEnvironmentSchema);
     expect(env.ISB_LOCAL_JWKS_URI).toBe(LOCAL_JWKS_URI);
     expect(env.ISB_LOCAL_JWKS_URI).toContain("isb-local-edge");
+    const url = new URL(env.ISB_LOCAL_JWKS_URI);
+    expect(url.protocol).toBe("https:");
+    // The host is what the edge's certificate carries a SAN for, and the path is
+    // the only route on the TLS listener — both are cross-checked against the
+    // constants rather than spelled out, so a rename fails here.
+    expect(url.hostname).toBe(LOCAL_EDGE_SERVICE_NAME);
+    expect(url.port).toBe(String(LOCAL_EDGE_TLS_PORT));
+    expect(url.pathname).toBe(LOCAL_JWKS_PATH);
+  });
+
+  // The TLS handshake is only trusted because of this. Node reads
+  // NODE_EXTRA_CA_CERTS once at process start and adds the file to the default
+  // root store, which `tls.connect` consults when the client sets no `ca` of its
+  // own — and `https.request` sets none. Without this, the JWKS fetch fails with
+  // a self-signed-certificate error that names the certificate and not the
+  // environment variable that was supposed to prevent it.
+  //
+  // The path has to match where the bundling hook copies the file, at the
+  // artifact root. Node's response to a NODE_EXTRA_CA_CERTS file that is not
+  // there is a warning on stderr, not an error, so a wrong path would produce
+  // six Lambdas that come up healthy and then fail every request.
+  it("points NODE_EXTRA_CA_CERTS at the CA the bundling hook copies", () => {
+    for (const schema of [
+      LeaseTemplateLambdaEnvironmentSchema,
+      LeaseLambdaEnvironmentSchema,
+      PrincipalsLambdaEnvironmentSchema,
+    ]) {
+      const env = buildLocalEnv(schema);
+      expect(env.NODE_EXTRA_CA_CERTS).toBe(LOCAL_CA_CERTIFICATE_IN_TASK_ROOT);
+      // `/var/task` is what LAMBDA_TASK_ROOT names, and the hook copies to
+      // `outputDir`, the same directory — so "at the artifact root" and "the
+      // path in the environment" are one statement.
+      expect(env.NODE_EXTRA_CA_CERTS).toBe(
+        `/var/task/${LOCAL_CA_CERTIFICATE_FILENAME}`,
+      );
+      // A relative path would resolve against the process's working directory,
+      // which is not the artifact root on every runtime.
+      expect(env.NODE_EXTRA_CA_CERTS.startsWith("/")).toBe(true);
+    }
+  });
+
+  // The two halves of the arrangement, cross-checked: the CA the environment
+  // names is the one whose certificate the edge serves, and it is a *different*
+  // document from the leaf. If the bundled file were the served certificate then
+  // anything that had read the leaf off the wire — the edge hands it to every
+  // caller of the JWKS route, and `local:verify` reads it — could impersonate
+  // the edge to every Lambda.
+  it("trusts a CA that is not the certificate the edge presents", () => {
+    const env = buildLocalEnv(LeaseTemplateLambdaEnvironmentSchema);
+    const dir = mkdtempSync(join(tmpdir(), "isb-local-env-ca-"));
+    const previous = process.env.ISB_LOCAL_KEY_DIR;
+    process.env.ISB_LOCAL_KEY_DIR = dir;
+    try {
+      const credentials = loadOrCreateDevTlsCredentials();
+      const path = localCaCertificatePath();
+      expect(path.startsWith(dir)).toBe(true);
+      const bundled = readFileSync(path, "utf-8");
+      // The file the `cp` will put at NODE_EXTRA_CA_CERTS.
+      expect(bundled).toBe(credentials.caCertificatePem);
+      expect(bundled).not.toBe(credentials.serverCertificatePem);
+      // And the leaf verifies against it, which is the whole point.
+      const ca = new X509Certificate(bundled);
+      expect(
+        new X509Certificate(credentials.serverCertificatePem).verify(
+          ca.publicKey,
+        ),
+      ).toBe(true);
+    } finally {
+      if (previous === undefined) delete process.env.ISB_LOCAL_KEY_DIR;
+      else process.env.ISB_LOCAL_KEY_DIR = previous;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // NODE_EXTRA_CA_CERTS *adds* to the system store rather than replacing it, so
+  // setting it does not break the SDKs' own TLS. Stated because a future change
+  // that reached for `NODE_TLS_REJECT_UNAUTHORIZED=0` — the usual "fix" for a
+  // certificate error — would turn every verification failure into a silent
+  // acceptance, and that is a materially worse thing to find in a diff.
+  it("does not disable certificate verification anywhere in the environment", () => {
+    const env = buildLocalEnv(LeaseTemplateLambdaEnvironmentSchema);
+    expect(env.NODE_TLS_REJECT_UNAUTHORIZED).toBeUndefined();
+    expect("NODE_OPTIONS").toBeDefined();
+    // The trust is a trust anchor, not a bypass.
+    expect(env.NODE_OPTIONS).not.toMatch(/reject-unauthorized|insecure/);
   });
 
   it("points every AWS client at LocalStack and disables X-Ray", () => {

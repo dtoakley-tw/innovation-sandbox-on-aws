@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import { App } from "aws-cdk-lib";
 import { Template } from "aws-cdk-lib/assertions";
-import { createHash } from "node:crypto";
+import { X509Certificate, createHash } from "node:crypto";
 import {
   existsSync,
   mkdtempSync,
@@ -17,6 +17,12 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
+import {
+  LOCAL_CA_CERTIFICATE_FILENAME,
+  LOCAL_CA_CERTIFICATE_IN_TASK_ROOT,
+  loadOrCreateDevTlsCredentials,
+  localCaCertificatePath,
+} from "../../edge/dev-ca.js";
 import {
   LOCAL_STAGE,
   localTableNames,
@@ -46,19 +52,30 @@ const DOMAINS = [
 let outdir: string;
 let stack: LocalComputeStack;
 let template: Template;
+let keyDir: string;
+let originalKeyDir: string | undefined;
 
 beforeAll(() => {
   // A real outdir, in a temp directory the suite removes: the artifact
   // assertion below reads the bundled asset off disk, and `App` would
   // otherwise drop a `cdk.out` into whatever directory the test ran from.
   outdir = mkdtempSync(join(tmpdir(), "isb-local-compute-"));
+  // The CA the hook copies has to be a real one, and minting it into
+  // `local/.keys` would mean a test run had a side effect on the developer's
+  // profile. A temp directory is the same code path with none of that.
+  keyDir = mkdtempSync(join(tmpdir(), "isb-local-compute-keys-"));
+  originalKeyDir = process.env.ISB_LOCAL_KEY_DIR;
+  process.env.ISB_LOCAL_KEY_DIR = keyDir;
   const app = new App({ outdir });
   stack = new LocalComputeStack(app, "IsbLocalCompute", { env });
   template = Template.fromStack(stack);
 });
 
 afterAll(() => {
+  if (originalKeyDir === undefined) delete process.env.ISB_LOCAL_KEY_DIR;
+  else process.env.ISB_LOCAL_KEY_DIR = originalKeyDir;
   rmSync(outdir, { recursive: true, force: true });
+  rmSync(keyDir, { recursive: true, force: true });
 });
 
 const functions = (): Record<string, any> =>
@@ -363,5 +380,103 @@ describe("LocalComputeStack", () => {
         ),
       ].sort(),
     );
+  });
+
+  // The CA the Lambdas are given, at the artifact root, which is the only place
+  // a Lambda can see it: a host path in NODE_EXTRA_CA_CERTS would be a file that
+  // does not exist inside the function, and Node's response to a missing
+  // NODE_EXTRA_CA_CERTS file is a warning on stderr rather than an error — so the
+  // Lambdas would come up healthy and then fail every JWKS fetch with a TLS error
+  // that names the certificate and not the missing file.
+  it("ships the development CA at the artifact root, where NODE_EXTRA_CA_CERTS names it", () => {
+    expect(artifacts()).toHaveLength(DOMAINS.length);
+    const source = localCaCertificatePath();
+    expect(source.startsWith(keyDir)).toBe(true);
+    const wanted = readFileSync(source, "utf-8");
+    for (const artifact of artifacts()) {
+      const target = join(artifact, LOCAL_CA_CERTIFICATE_FILENAME);
+      expect(existsSync(target), artifact).toBe(true);
+      // Byte-identical, not merely a certificate: two CAs would leave the edge
+      // serving a certificate the bundle cannot verify, and every authenticated
+      // request would fail at key retrieval.
+      expect(readFileSync(target, "utf-8"), artifact).toBe(wanted);
+      // And the path the environment names is this one, under `/var/task`,
+      // which is what `LAMBDA_TASK_ROOT` is and what `outputDir` becomes.
+      expect(LOCAL_CA_CERTIFICATE_IN_TASK_ROOT).toBe(
+        `/var/task/${LOCAL_CA_CERTIFICATE_FILENAME}`,
+      );
+    }
+  });
+
+  // The two halves of the arrangement, in one place: the CA in the bundle is the
+  // issuer of the certificate the edge will present, and it is a *different*
+  // document from that certificate. Were it the same, the leaf the edge hands to
+  // every caller of the JWKS route would also be a trust anchor.
+  it("bundles a CA that can verify the edge's leaf", () => {
+    const bundled = new X509Certificate(
+      readFileSync(
+        join(artifacts()[0], LOCAL_CA_CERTIFICATE_FILENAME),
+        "utf-8",
+      ),
+    );
+    // `X509_check_ca` is what OpenSSL's verifier asks, and it returns false for a
+    // CA whose keyUsage lacks keyCertSign — a certificate that parses perfectly
+    // and is then refused at chain-build time.
+    expect(bundled.ca).toBe(true);
+    // The same CA the edge will load from its own key directory, so the two
+    // participants in the race converge rather than each minting one.
+    expect(
+      bundled.raw.equals(
+        new X509Certificate(readFileSync(localCaCertificatePath(), "utf-8"))
+          .raw,
+      ),
+    ).toBe(true);
+    // And it verifies a leaf minted *after* the synth ran, which is exactly what
+    // the edge does: `loadOrCreateDevTlsCredentials` reads the CA the synth left
+    // behind and signs a leaf with it. If the two ever produced different CAs,
+    // this is where it would show.
+    const credentials = loadOrCreateDevTlsCredentials();
+    expect(
+      new X509Certificate(credentials.serverCertificatePem).verify(
+        bundled.publicKey,
+      ),
+    ).toBe(true);
+    // And the leaf is stored under a name carrying the CA's fingerprint, so a
+    // leaf can only ever be loaded for the CA that signed it.
+    expect(
+      readdirSync(keyDir).filter((name) =>
+        name.startsWith("local-dev-edge-cert-"),
+      ),
+    ).toHaveLength(1);
+  });
+
+  // The environment half, on the template rather than on `buildLocalEnv`, so
+  // what is asserted is what CDK would deploy.
+  it("configures every function to trust the bundled CA", () => {
+    for (const fn of Object.values<any>(functions())) {
+      expect(fn.Properties.Environment.Variables.NODE_EXTRA_CA_CERTS).toBe(
+        LOCAL_CA_CERTIFICATE_IN_TASK_ROOT,
+      );
+      // The JWKS URL has to be https, or the fetch fails before any certificate
+      // is looked at.
+      expect(fn.Properties.Environment.Variables.ISB_LOCAL_JWKS_URI).toMatch(
+        /^https:\/\/isb-local-edge:/,
+      );
+    }
+  });
+
+  // `re2.wasm` and the CA are both `cp`s into the artifact root, and adding the
+  // second must not have displaced the first. Asserted as the exact set rather
+  // than as "re2.wasm is still there", because the failure this guards is the
+  // one where the extra copy overwrites or renames something.
+  it("copies both extras to the artifact root and nothing else", () => {
+    for (const artifact of artifacts()) {
+      const extraFiles = readdirSync(artifact)
+        .filter((name) => name.endsWith(".wasm") || name.endsWith(".pem"))
+        .sort();
+      expect(extraFiles, artifact).toEqual(
+        [LOCAL_CA_CERTIFICATE_FILENAME, "re2.wasm"].sort(),
+      );
+    }
   });
 });

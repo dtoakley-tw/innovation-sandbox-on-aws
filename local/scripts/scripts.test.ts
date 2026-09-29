@@ -15,6 +15,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
+import { localKeyDir } from "../edge/key-store.js";
 import {
   LOCAL_JWKS_URI,
   LOCALSTACK_ENDPOINT,
@@ -22,6 +23,8 @@ import {
 import {
   LOCAL_ACCOUNT_ID,
   LOCAL_EDGE_PORT,
+  LOCAL_EDGE_SERVICE_NAME,
+  LOCAL_EDGE_TLS_PORT,
   LOCAL_REGION,
   LOCAL_STAGE,
 } from "../shared/names.js";
@@ -139,6 +142,71 @@ describe("local compose profile", () => {
     expect(read("compose.yaml")).toContain(
       `"${LOCAL_EDGE_PORT}:${LOCAL_EDGE_PORT}"`,
     );
+  });
+
+  // The TLS listener exists for the Lambdas, and the Lambdas are the only things
+  // on the `isb-local` network that have any reason to reach it. Publishing it
+  // would put a TLS endpoint on the developer's `localhost` for no benefit — and
+  // it would make the port reachable from anything running on the host, which is
+  // a wider surface than the one that needs it. Pinned because the file's only
+  // `ports:` entry for the edge is the HTTP one, and a `4600:4600` added later
+  // would pass every other test in this file.
+  it("does not publish the edge's TLS port to the host", () => {
+    const service = composeService(LOCAL_EDGE_SERVICE_NAME);
+    const published = (service.match(/^\s+- "([^"]+)"/gm) ?? []).map((line) =>
+      line.replace(/^\s+- "/, "").replace(/"$/, ""),
+    );
+    expect(published).toEqual([`${LOCAL_EDGE_PORT}:${LOCAL_EDGE_PORT}`]);
+    // The JWKS endpoint the Lambdas use names a port nothing on the host
+    // publishes, and the file has no mapping for it at all.
+    expect(new URL(LOCAL_JWKS_URI).port).toBe(String(LOCAL_EDGE_TLS_PORT));
+    expect(read("compose.yaml")).not.toContain(
+      `${LOCAL_EDGE_TLS_PORT}:${LOCAL_EDGE_TLS_PORT}`,
+    );
+    // And it is a distinct port, so "published" cannot be satisfied by the
+    // browser's port being renamed into it.
+    expect(LOCAL_EDGE_TLS_PORT).not.toBe(LOCAL_EDGE_PORT);
+  });
+
+  // The key directory is shared state between the edge container and the host,
+  // and the TLS material in it has to be the *same* material on both sides: the
+  // edge serves a leaf and the CDK synth copies the CA that signed it into six
+  // Lambda bundles. Two directories would mean two CAs and a TLS error in every
+  // authenticated request.
+  it("points the edge container at the same key directory the synth resolves", () => {
+    const declared = composeService(LOCAL_EDGE_SERVICE_NAME).match(
+      /ISB_LOCAL_KEY_DIR:\s*"([^"]+)"/,
+    )?.[1];
+    expect(declared).toBeDefined();
+    // The compose file already gives the container's path absolutely, and
+    // `/workspace` is the repository root inside it (`..:/workspace`), so this
+    // names `local/.keys` on both sides rather than only in the container.
+    const inContainer = declared as string;
+    expect(inContainer).toBe("/workspace/local/.keys");
+    // The host side is what `key-store.ts` resolves when the variable is unset:
+    // `local/.keys` beside `local/edge/`. Cross-checked against the resolved
+    // value rather than spelled out again.
+    const resolved = localKeyDir();
+    expect(resolved.endsWith(join("local", ".keys"))).toBe(true);
+    expect(inContainer.endsWith(join("local", ".keys"))).toBe(true);
+  });
+
+  // `waitForLocalEdge` polls the HTTP port because that is what the host can
+  // reach. If the edge came up its HTTP listener and then failed the TLS
+  // self-check, the wait would pass and `local:up` would report success with
+  // every authenticated request broken — so the edge is expected to be fatal on
+  // that failure rather than to log and carry on, and the wait is the only thing
+  // standing between a broken edge and a green `local:up`.
+  it("waits on the health port, and the edge treats a TLS failure as fatal", () => {
+    const up = read("scripts/local-up.sh");
+    expect(bashFunction(up, "waitForLocalEdge")).toContain(
+      `http://localhost:${LOCAL_EDGE_PORT}/healthz`,
+    );
+    // Not a silent log line: the startup handler has to exit non-zero.
+    expect(read("edge/server.ts")).toMatch(
+      /await assertLocalJwksOverTls\(credentials\)/,
+    );
+    expect(read("edge/server.ts")).toMatch(/process\.exit\(1\)/);
   });
 
   // The edge installs its dependencies into the working tree it is bind-mounted,

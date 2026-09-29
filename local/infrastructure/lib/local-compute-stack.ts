@@ -32,6 +32,10 @@ import {
 } from "@amzn/innovation-sandbox-infrastructure/lib/components/api/prepare-api-gateway-spec.js";
 
 import {
+  LOCAL_CA_CERTIFICATE_FILENAME,
+  localCaCertificatePath,
+} from "../../edge/dev-ca.js";
+import {
   LOCAL_STAGE,
   LOCALSTACK_INTERNAL_ENDPOINT,
 } from "../../shared/names.js";
@@ -132,10 +136,36 @@ export function resolveRe2WasmBinary(
 /** Where the binary is, resolved once per synth. */
 const re2WasmBinary = resolveRe2WasmBinary();
 
+/**
+ * Where the development CA certificate is, resolved once per synth and memoized
+ * because `NodejsFunction` bundles in its constructor, so this hook runs six
+ * times for one stack.
+ *
+ * Memoized rather than resolved at module load — unlike `re2WasmBinary` above,
+ * which only reads — because this call *mints* the CA if the key directory has
+ * none. That is the point of it: the CA has to exist before the Lambdas can be
+ * given it, and on a first `local:up` the edge container may not have run yet.
+ * Making the synth the thing that produces it is what removes the ordering
+ * requirement; see `dev-ca.ts` for why the two sides converge rather than race.
+ *
+ * Still resolved at synth rather than inside the `cp` below, so a failure names
+ * the cause instead of surfacing as a shell error inside esbuild's output.
+ */
+let localCaCertificate: string | undefined;
+const caCertificateForBundling = (): string => {
+  localCaCertificate ??= localCaCertificatePath();
+  return localCaCertificate;
+};
+
 /** Single-quotes a path for the `bash -c` the bundling command runs under. */
 const shellQuote = (value: string) => `'${value.replaceAll("'", `'\\''`)}'`;
 
-const copyRe2Wasm: ICommandHooks = {
+/**
+ * The one bundling hook for every domain Lambda. Two things land in the artifact
+ * that no bundler can put there, and both are `cp`s rather than `loader`s for the
+ * same reason: neither file is in esbuild's module graph.
+ */
+const localBundleExtras: ICommandHooks = {
   // All three methods are part of `ICommandHooks` and all three must be present:
   // CDK calls `beforeBundling` and `afterBundling` unconditionally, so a missing
   // method is a `TypeError` at synth. `beforeInstall` is only called when
@@ -184,6 +214,25 @@ const copyRe2Wasm: ICommandHooks = {
    */
   afterBundling: (_inputDir: string, outputDir: string) => [
     `cp ${shellQuote(re2WasmBinary)} ${shellQuote(join(outputDir, "re2.wasm"))}`,
+    // The development CA, to the artifact root, because that is the path
+    // `NODE_EXTRA_CA_CERTS` in `lambda-environment.ts` names. Node reads that
+    // variable once, at process start, and adds the file to the default root
+    // store; `aws-jwt-verify` then reaches the edge's TLS listener through
+    // `https.request` → `tls.connect` with no explicit `ca`, which consults that
+    // store. Nothing under `source/` is involved, and nothing under `source/`
+    // can be.
+    //
+    // Copying rather than pointing `NODE_EXTRA_CA_CERTS` at a path outside
+    // `/var/task` is what makes this work at all: a Lambda can see only its own
+    // unpacked artifact and `/tmp`, so a host path would be a file that does not
+    // exist at cold start — and Node's response to a missing `NODE_EXTRA_CA_CERTS`
+    // file is a warning on stderr, not an error, so the Lambdas would come up
+    // healthy and then fail every JWKS fetch with a TLS error. Copying also means
+    // the CA and the bundle are deployed together: there is no window in which
+    // one has been updated and the other has not.
+    `cp ${shellQuote(caCertificateForBundling())} ${shellQuote(
+      join(outputDir, LOCAL_CA_CERTIFICATE_FILENAME),
+    )}`,
   ],
 };
 
@@ -346,7 +395,7 @@ export class LocalComputeStack extends Stack {
         // No `format`/`target`, matching `IsbLambdaFunction`: the target
         // defaults to the runtime's own node version, and CJS is the default
         // output format.
-        commandHooks: copyRe2Wasm,
+        commandHooks: localBundleExtras,
       },
     });
   }

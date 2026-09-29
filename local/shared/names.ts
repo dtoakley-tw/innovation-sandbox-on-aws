@@ -17,7 +17,49 @@ export const LOCAL_NAMESPACE = "isbdev";
 export const LOCAL_USER_POOL_ID = "us-east-1_localdev";
 export const LOCAL_APP_CLIENT_ID = "localdevclientid";
 export const LOCAL_STAGE = "local";
+
+/**
+ * The compose service name the Lambdas resolve the edge by, and the only host
+ * in `LOCAL_JWKS_URI`. One constant for both uses, because the second is
+ * derived from the first: the edge's TLS certificate carries a SAN for exactly
+ * the host the Lambdas connect to, and a name spelled in two places is how a
+ * profile ends up serving a certificate that validates for nothing.
+ */
+export const LOCAL_EDGE_SERVICE_NAME = "isb-local-edge";
+
+/**
+ * The browser's route in, and it has to stay plain HTTP: the browser reaches it
+ * directly for `/session`, and a certificate here would mean a trust prompt on
+ * every page load. `LOCAL_EDGE_TLS_PORT` is the other listener.
+ */
 export const LOCAL_EDGE_PORT = 4599;
+
+/**
+ * A second listener in the *same* edge process, serving `/.well-known/jwks.json`
+ * over TLS, for the Lambdas only.
+ *
+ * It exists because `aws-jwt-verify@4.0.1` fetches the JWKS with
+ * `node:https.request` and no code path down to plain `http:` — on an `http://`
+ * URI it throws `ERR_INVALID_PROTOCOL` before a packet leaves the container, so
+ * every authenticated request failed at key retrieval. Serving the same document
+ * over HTTPS with a development CA the Lambda trusts via `NODE_EXTRA_CA_CERTS`
+ * is the fix that needs no change under `source/`.
+ *
+ * Deliberately *not* published to the host in `local/compose.yaml`: nothing on
+ * the host calls it, the browser has no reason to, and publishing it would put
+ * a TLS endpoint on the developer's `localhost` for no benefit. Reachability is
+ * the `isb-local` network, which is all the Lambdas have.
+ */
+export const LOCAL_EDGE_TLS_PORT = 4600;
+
+export const LOCAL_JWKS_PATH = "/.well-known/jwks.json";
+
+/**
+ * Where the Lambdas load the JWKS from. `https`, on the TLS port above and the
+ * service name above, which is what makes `ISB_LOCAL_JWKS_URI` and the
+ * certificate the edge serves the same endpoint expressed twice.
+ */
+export const LOCAL_JWKS_URI = `https://${LOCAL_EDGE_SERVICE_NAME}:${LOCAL_EDGE_TLS_PORT}${LOCAL_JWKS_PATH}`;
 
 /**
  * LocalStack as seen from *inside* the `isb-local` Docker network — by the

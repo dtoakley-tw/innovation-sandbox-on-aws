@@ -105,31 +105,62 @@ local edge's `501 Not Implemented Locally` exists only as a fallback for a path
 that was genuinely not provisioned, and `local:verify` fails the run if any of
 these flows is satisfied by it.
 
+## How the Lambdas reach the edge
+
+The edge has **two listeners in one process**.
+
+| Listener            | Port   | Reached by                      | Serves                                     |
+| ------------------- | ------ | ------------------------------- | ------------------------------------------ |
+| Browser-facing HTTP | `4599` | the browser, via the Vite proxy | `/config.json`, `/api/*`, `/session`       |
+| Lambdas' TLS        | `4600` | the Lambdas, on `isb-local`     | `/.well-known/jwks.json`, and nothing else |
+
+The second one exists because `aws-jwt-verify@4.0.1` fetches the JWKS through
+`node:https.request` and has no code path down to plain `http:` — on an `http://`
+URI it throws `ERR_INVALID_PROTOCOL` before a packet is sent, so
+`source/common/lambda/auth/identity-token-verifier.ts`'s `ensureLocalJwks` could
+never load the key set and every authenticated request failed at key retrieval.
+The other way to fix that is a change under `source/`, which this profile exists
+to avoid.
+
+`4599` stays plain HTTP because the browser reaches it directly and a certificate
+there would mean a trust prompt on every page load. `4600` is **not published to
+the host** (`local/compose.yaml`): only the Lambdas, on the `isb-local` network,
+have any reason to reach it, and nothing about the browser needs a TLS endpoint
+on `localhost`.
+
+Trust is established with a development CA (`local/edge/dev-ca.ts`), which has to
+exist in two places at two different moments, in processes that do not start
+together: `cdk deploy` copies it into each Lambda artifact at bundle time, and
+the edge serves a leaf it signed. Whichever side gets there first mints it and
+the other reads it back. Both call the same idempotent function and the create is
+atomic, so the race resolves to one CA rather than two. Each Lambda is given
+`NODE_EXTRA_CA_CERTS=/var/task/isb-local-ca.pem`, which Node reads once at
+process start and adds to the default root store — so `https.request` trusts the
+edge without a line changed under `source/`.
+
+The CA and the leaf are deliberately different documents. The edge hands its
+certificate to every caller of the JWKS route, so if that document were also the
+trust anchor, anything that had read it off the wire could impersonate the edge
+to every Lambda.
+
+### CORS
+
+`/session` is the only cross-origin request the browser makes: the Vite proxy
+forwards `/api` and `/config.json` (`PROXIED_PATHS` in
+`source/frontend/vite/resolve-proxy-target.ts`), but `/session` is not on that
+list and the frontend fetches `VITE_LOCAL_SESSION_ENDPOINT` as an absolute URL.
+The edge echoes `Access-Control-Allow-Origin` for **loopback origins only**
+(`http://localhost`, `http://127.0.0.1` or `http://[::1]`, any port — Vite moves
+to 5174 when 5173 is taken) and sends nothing for anything else. A wildcard would
+work and would also let any page a developer visits authorize itself to read a
+signed identity token out of their browser. See `local/edge/routes/cors.ts`.
+
 ## Known defects
 
-Found by the bring-up in Task 13. All are reported, not fixed; the first is in
-`source/` and the rest are gaps in `local/`. Each is reproducible with the
-commands shown.
+Found by the bring-up in Task 13. All are reported, not fixed; they are gaps in
+`local/`. Each is reproducible with the commands shown.
 
-**1. Every authenticated request fails. `aws-jwt-verify` cannot fetch an `http://`
-JWKS.** `identity-token-verifier.ts` calls `fetchJwks` from
-`aws-jwt-verify/jwk`, which is built on `node:https` and throws
-`TypeError [ERR_INVALID_PROTOCOL]: Protocol "http:" not supported. Expected
-"https:"`. `ISB_LOCAL_JWKS_URI` is `http://isb-local-edge:4599/...`, so the
-fetch never happens and every request 500s.
-
-This is **not** a network problem. From inside the Lambda container:
-
-```
-$ docker exec <lambda> node -e "fetch('http://isb-local-edge:4599/.well-known/jwks.json').then(r=>r.text()).then(t=>console.log('OK',t.slice(0,60)))"
-OK {"keys":[{"kty":"RSA","alg":"RS256","use":"sig","kid":"YfybFdLGXnNZ_xAE","n":"uD…
-```
-
-The compose network, the container names, and the `COGNITO_USER_POOL_ID` /
-`iss` match are all correct. Only the protocol is wrong, and the fix belongs in
-`source/`.
-
-**2. Two SSM parameters the Lambdas read are never created.**
+**1. Two SSM parameters the Lambdas read are never created.**
 `/isb/isbdev/account-pool/config` and `/isb/isbdev/idc/config` are named in
 `buildLocalEnv` and read through `@aws-lambda-powertools/parameters`, but no
 local resource creates them and the seed does not write them. This breaks
@@ -137,28 +168,19 @@ local resource creates them and the seed does not write them. This breaks
 _masks_ the account lifecycle boundary: `quarantine` and `eject` fail with
 `GetParameterError` instead of reaching Organizations.
 
-**3. `GET /leases/shared` is unreachable.** LocalStack's API Gateway matches
+**2. `GET /leases/shared` is unreachable.** LocalStack's API Gateway matches
 `/leases/{leaseId}` before the static `/leases/shared`, so the request reaches
 `GetLease` and returns `400 LeaseId path parameter provided is invalid.` The
 resources themselves are imported correctly — `awslocal apigateway get-resources`
 shows both — so this is LocalStack's route precedence, not the spec transform.
 
-**4. The first request to each Lambda answers 502.** After the
+**3. The first request to each Lambda answers 502.** After the
 `LAMBDA_RUNTIME_ENVIRONMENT_TIMEOUT` of 60 s reaps an execution environment, the
 next request returns `502 {"message": "Internal server error"}` in 13–46 ms
 with no Lambda log at all, and the one after it succeeds after a 5–9 s cold
 start. Reproducible 5/5. This is the first page load after every `local:up`.
 
-**5. `/session` is cross-origin and the edge sends no CORS headers.** The Vite
-proxy only forwards `/api` and `/config.json`
-(`PROXIED_PATHS` in `source/frontend/vite/resolve-proxy-target.ts`), so the
-documented `VITE_LOCAL_SESSION_ENDPOINT=http://localhost:4599/session` is a
-different origin from `http://localhost:5173`. The edge's `/session` response
-carries no `access-control-allow-origin`, so a browser will block it,
-`loadSession()` will return `null`, and the app will render logged out. **Not
-confirmed in a browser** — see "Not verified" below.
-
-**6. LocalStack's gateway process dies partway through a full walk, and the
+**4. LocalStack's gateway process dies partway through a full walk, and the
 container keeps reporting `healthy`.** Reproduced three times in one session,
 including twice on a completely clean start. The symptom is always the same: the
 log stops mid-line, port 4566 accepts nothing
@@ -168,16 +190,18 @@ no gateway process, and the edge reports
 `Local edge could not reach the LocalStack API Gateway: fetch failed`.
 `docker compose ps` still says `(healthy)`.
 
-The likely cause is memory. Each Lambda container settles at 360–430 MB
-(`docker stats`), six of them plus the two compose services is ~2.6 GB, and
-Docker's total limit on this machine is 1.91 GB. `local/compose.yaml` bounds
-`LAMBDA_RUNTIME_ENVIRONMENT_TIMEOUT` but not the number of concurrently running
-Lambda containers, and a full six-domain walk starts all six at once.
+Confirmed to be memory, not LocalStack: with Docker capped at 1.91 GB the
+LocalStack container reports `OOMKilled: true` and the walk collapses to 502s
+across every domain. Giving the Docker VM more room (`colima start --memory 6
+--cpu 4`) makes it disappear, so the memory bound — not the profile — is what the
+walk runs into. `local/compose.yaml` bounds `LAMBDA_RUNTIME_ENVIRONMENT_TIMEOUT`
+but not the number of concurrently running Lambda containers, and a full
+six-domain walk starts all six at once.
 
 Recovery is not `local:reset` on its own. When the gateway dies, its Lambda
 containers are orphaned, stay `Up`, and keep `isb-local` attached, so
-`docker compose down` prints `Network isb-local Resource is still in use` and
-the next `local:up` inherits the orphans and does not come back. What works:
+`docker compose down` prints `Network isb-local Resource is still in use` and the
+next `local:up` inherits the orphans and does not come back. What works:
 
 ```bash
 npm run local:down
@@ -186,7 +210,7 @@ docker network rm isb-local
 npm run local:up
 ```
 
-**7. `local:down` cannot always complete.** It aborts on
+**5. `local:down` cannot always complete.** It aborts on
 `set -euo pipefail` when `docker compose down` hits the "Resource is still in
 use" above, before `rm -rf local/cdk.out`, so a stale `cdk.out` survives and the
 next `local:up` may read stale outputs. The orphan cleanup above avoids it.
@@ -202,12 +226,17 @@ the documented design decision, not a bug. `local:verify` will trigger it: its
 
 ## Not verified
 
-- **The browser.** No desktop browser was connected to the Task 13 session, so
-  no page was rendered and no console was read. The Vite proxy path was
-  exercised with `curl` instead — `/config.json` and an authenticated
-  `/api/leases` both return the expected data through `http://localhost:5173` —
-  but that does not exercise `fetchAuthSession()`, the React tree, or CORS.
-  Defect 5 is predicted from the response headers, not observed.
+- **The browser.** No desktop browser has been connected to this session, so no
+  page has been rendered and no console has been read. What _was_ exercised
+  against a running Vite dev server on `http://localhost:5173`: `/config.json` and
+  an authenticated `/api/leases` both return the expected data through the proxy,
+  and a `GET /session` carrying `Origin: http://localhost:5173` returns
+  `access-control-allow-origin: http://localhost:5173` with a usable token, while
+  `https://evil.example`, `http://localhost.evil.test:5173` and
+  `https://localhost:5173` get no CORS header at all. That is the header contract
+  a browser enforces, from a real client — but it does not exercise
+  `fetchAuthSession()`, the React tree, or a real CORS check. Treat the app
+  rendering signed-in as unconfirmed.
 - **Cost reporting and account cleanup.** Neither is reachable through the six
   API domains: cost reporting is a separate scheduled Lambda the profile does
   not deploy, and cleanup is driven by CodeBuild and ECR. They are out of scope
@@ -220,10 +249,21 @@ the documented design decision, not a bug. `local:verify` will trigger it: its
 local/
   compose.yaml        LocalStack + the local edge
   edge/               the local edge: /config.json, /api/*, /session, JWKS, 501
+    dev-ca.ts           the development CA and the edge's certificate
+    key-store.ts        where key material lives, and how it is written
+    routes/cors.ts      the loopback-only CORS policy for /session
   infrastructure/     a reduced CDK app reusing the upstream constructs
   seed/               schema-derived fixtures, written with unconditional Puts
   verify/             `local:verify` — the API walk
   e2e/smoke.ts        the fast health check
   scripts/            local:up / down / reset / logs
   shared/names.ts     every local resource name, in one place
+  .keys/              the signing key and the CA — gitignored, kept by local:down
 ```
+
+`local/.keys` holds the two pieces of state that must agree between processes:
+the JWKS signing key the edge uses, and the development CA the synth bundles and
+the edge serves a leaf from. `local:down` keeps it, like the `node_modules`
+volume, because a trust anchor is a cache and not a distributed artifact. Remove
+it by hand to rotate; `local:up` mints whatever is missing, and mints it
+identically from either side.

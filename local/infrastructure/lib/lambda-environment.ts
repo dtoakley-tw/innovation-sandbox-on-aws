@@ -2,9 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 import type { ZodType } from "zod";
 
+import { LOCAL_CA_CERTIFICATE_IN_TASK_ROOT } from "../../edge/dev-ca.js";
 import {
   LOCAL_APP_CLIENT_ID,
   LOCAL_EDGE_PORT,
+  LOCAL_JWKS_URI,
   LOCAL_NAMESPACE,
   LOCAL_REGION,
   LOCAL_USER_POOL_ID,
@@ -14,10 +16,17 @@ import {
 } from "../../shared/names.js";
 
 /**
- * The Lambdas run inside LocalStack's Docker network, so they reach the edge by
- * service name rather than the published host port the browser uses.
+ * The address the Lambdas load the JWKS from: the edge, by service name on the
+ * compose network, over TLS. Imported from `names.ts` rather than assembled
+ * here, because the certificate the edge serves carries a subjectAltName for
+ * exactly the host in that URI and a second spelling of either would break the
+ * handshake with an error that names neither.
+ *
+ * Re-exported because this name is this module's contract with the Lambdas' own
+ * environment schema; a test importing it from a different file would be
+ * checking that the two agree rather than that the value is right.
  */
-export const LOCAL_JWKS_URI = `http://isb-local-edge:${LOCAL_EDGE_PORT}/.well-known/jwks.json`;
+export { LOCAL_JWKS_URI };
 
 /** Values every API Lambda needs regardless of domain. */
 const commonEnv: Record<string, string> = {
@@ -37,6 +46,23 @@ const commonEnv: Record<string, string> = {
   COGNITO_APP_CLIENT_ID: LOCAL_APP_CLIENT_ID,
   ISB_NAMESPACE: LOCAL_NAMESPACE,
   ISB_LOCAL_JWKS_URI: LOCAL_JWKS_URI,
+  /**
+   * The local development CA, at the artifact root, where the bundling hook
+   * copies it (`local-compute-stack.ts`).
+   *
+   * `aws-jwt-verify@4.0.1` fetches the JWKS with `node:https.request` and
+   * nothing below it reaches plain `http:`, so `ISB_LOCAL_JWKS_URI` above is
+   * `https://` and the edge signs that connection with a certificate this CA
+   * issued. Node reads `NODE_EXTRA_CA_CERTS` once at process start and adds the
+   * file to the default root store, which is what `tls.connect` consults when
+   * the client sets no `ca` of its own — so `https.request` trusts the edge
+   * without a line changed under `source/`.
+   *
+   * Unconditional rather than conditional, because this environment is only ever
+   * assembled for the local profile: the deployed stacks are built by
+   * `source/infrastructure` and never see `commonEnv`.
+   */
+  NODE_EXTRA_CA_CERTS: LOCAL_CA_CERTIFICATE_IN_TASK_ROOT,
   CONFIG_TABLE_NAME: localTableNames.config,
   ACCOUNT_TABLE_NAME: localTableNames.sandboxAccount,
   LEASE_TABLE_NAME: localTableNames.lease,
