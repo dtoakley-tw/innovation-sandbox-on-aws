@@ -48,6 +48,7 @@ export default defineConfig(async ({ command, mode }) => {
       global: {},
       SOLUTION_VERSION: JSON.stringify(process.env.npm_package_version),
     },
+    envDir: path.resolve(__dirname, "..", ".."),
     build: {
       chunkSizeWarningLimit: 3000,
       rollupOptions: {
