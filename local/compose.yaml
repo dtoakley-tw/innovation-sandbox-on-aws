@@ -1,0 +1,98 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Local development only. Not part of the deployed distribution.
+services:
+  localstack:
+    image: localstack/localstack:4
+    ports:
+      - "4566:4566"
+    networks:
+      - isb-local
+    environment:
+      # Free tier. No SERVICES list so every available service is loaded.
+      DEBUG: "0"
+      LAMBDA_RUNTIME_ENVIRONMENT_TIMEOUT: "60"
+      # The network LocalStack attaches the Lambda containers it starts to.
+      # They have to resolve `isb-local-edge` (the JWKS fetch on every cold
+      # start) and `localstack` (every AWS SDK call, via AWS_ENDPOINT_URL) by
+      # name, and on Docker's default bridge neither name exists. Must equal the
+      # `name` of the network declared at the bottom of this file.
+      LAMBDA_DOCKER_NETWORK: "isb-local"
+    volumes:
+      # The Docker socket: LocalStack executes Lambda by starting real
+      # containers on the host daemon, and the current provider has no
+      # non-Docker fallback, so without this bind no Lambda starts at all. A
+      # host resource bound into a local development container — not a place
+      # LocalStack keeps data. Its state stays inside the container, which is
+      # what makes `local:reset` unambiguously a matter of recreating them.
+      - /var/run/docker.sock:/var/run/docker.sock
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4566/_localstack/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  isb-local-edge:
+    image: node:24-alpine
+    working_dir: /workspace
+    command: sh -c "corepack enable && npm install --no-audit --no-fund && npx tsx local/edge/server.ts"
+    ports:
+      # The browser's route in. 4599 mirrors LOCAL_EDGE_PORT in
+      # local/shared/names.ts, which the shell and the Vite proxy also use.
+      - "4599:4599"
+    networks:
+      - isb-local
+    environment:
+      # `localstack`, not `localhost`: the Lambdas this forwards to run as
+      # containers on the isb-local network, and inside a container localhost is
+      # the Lambdas' own. The same process is published on the host port above
+      # for the browser — the two addresses are not an inconsistency.
+      #
+      # The `${...}` is how the real id gets here: `local-up.sh` exports the
+      # invoke URL from the stack output before it recreates this service, and
+      # checks afterwards that the container has it. The `:-` default is the
+      # placeholder `restapis/0`, so a bare `docker compose up` still starts.
+      ISB_LOCAL_API_GATEWAY_INVOKE_URL: "${ISB_LOCAL_API_GATEWAY_INVOKE_URL:-http://localstack:4566/restapis/0/local/_user_request_}"
+      ISB_LOCAL_KEY_DIR: "/workspace/local/.keys"
+    volumes:
+      # The repository, so the edge runs the working tree rather than a copy
+      # that has to be rebuilt after every edit.
+      - ..:/workspace
+      # The `node_modules` in that working tree, shadowed by a volume of its own,
+      # so the `npm install` above writes *here* and not into the host's tree.
+      # Without this the edge, running Linux, prunes the host's platform-specific
+      # optional dependencies — `node_modules/@esbuild` loses its `darwin-*`
+      # package — and every host-side tool that shells out to one of them stops
+      # working. `cdk deploy` did, immediately after this script had finished a
+      # successful `npm install`: "You installed esbuild for another platform than
+      # the one you're currently using." The lockfile is left alone (npm found it
+      # already satisfying), so the dependency tree was the only thing the
+      # container was writing outside its own filesystem.
+      #
+      # Named rather than anonymous, and deliberately kept across
+      # `docker compose down`, so the install survives a stop and start instead
+      # of running again on every `local:up` — it is a dependency cache, not
+      # state, exactly as the host's own `node_modules` is. `local-down.sh`
+      # preserves `local/.keys` for the same reason. `docker compose down -v`
+      # (or `docker volume rm`) is what clears it.
+      - edge-node-modules:/workspace/node_modules
+    depends_on:
+      localstack:
+        condition: service_healthy
+
+# The `name:` is load-bearing: without it compose prefixes the project directory
+# onto the key, so the network would be `local_isb-local` in a checkout of this
+# directory and something else in a checkout of any other — and the only place
+# LocalStack learns the name is the variable above. Project-specific, so two
+# profiles on one machine cannot collide.
+networks:
+  isb-local:
+    name: isb-local
+
+# The edge's dependencies, kept out of the host's working tree. Declared at the
+# top level rather than inline so compose creates a real named volume it can be
+# addressed by; see the `isb-local-edge` service for why the edge needs one, and
+# for why it outlives `docker compose down`.
+volumes:
+  edge-node-modules:

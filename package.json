@@ -29,7 +29,13 @@
     "destroy:data": "./scripts/cdk/destroy.sh data --skip-confirmation",
     "destroy:compute": "./scripts/cdk/destroy.sh compute --skip-confirmation",
     "smithy:generate": "npm run generate --workspace @amzn/innovation-sandbox-api-model --",
-    "smithy:prepare": "npm run smithy:generate && npm run build --workspace @amzn/innovation-sandbox-api-client --workspace @amzn/innovation-sandbox-api-server"
+    "smithy:prepare": "npm run smithy:generate && npm run build --workspace @amzn/innovation-sandbox-api-client --workspace @amzn/innovation-sandbox-api-server",
+    "local:up": "bash local/scripts/local-up.sh",
+    "local:down": "bash local/scripts/local-down.sh",
+    "local:reset": "bash local/scripts/local-reset.sh",
+    "local:seed": "npm run seed --workspace @amzn/innovation-sandbox-local",
+    "local:verify": "npm run verify --workspace @amzn/innovation-sandbox-local",
+    "local:logs": "bash local/scripts/local-logs.sh"
   },
   "type": "module",
   "license": "Apache-2.0",
@@ -46,7 +52,8 @@
     "source/shared",
     "source/api-model",
     "source/api-client",
-    "source/api-server"
+    "source/api-server",
+    "local"
   ],
   "devDependencies": {
     "zod": "^4.1.12",

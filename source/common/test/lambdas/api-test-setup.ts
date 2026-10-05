@@ -44,6 +44,19 @@ vi.mock("aws-jwt-verify", () => ({
   CognitoJwtVerifier: {
     create: () => ({
       verify: async (token: string) => decodeTestToken(token),
+      // Reached: several API handler suites populate ISB_LOCAL_JWKS_URI with a
+      // generated string (see the `aws-jwt-verify/jwk` mock below). A no-op
+      // because the verifier that would consume these keys is stubbed here.
+      cacheJwks: () => {},
     }),
   },
+}));
+
+// `fetchJwks` is only called when ISB_LOCAL_JWKS_URI is set. Several API handler
+// suites build their env with `generateSchemaData(<Domain>Schema)`, which
+// populates that optional field with a random string; without this mock a
+// generated value would reach the network and fail the request. Keyed out so
+// the real `aws-jwt-verify/jwk` never issues a request under test.
+vi.mock("aws-jwt-verify/jwk", () => ({
+  fetchJwks: async () => ({ keys: [] }),
 }));

@@ -1,9 +1,12 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+import type { ResourcesConfig } from "aws-amplify";
 import { Amplify } from "aws-amplify";
 import { cognitoUserPoolsTokenProvider } from "aws-amplify/auth/cognito";
 import { sessionStorage } from "aws-amplify/utils";
+
+import { localSessionLibraryOptions } from "@amzn/innovation-sandbox-frontend/helpers/local/amplify-local-session";
 
 export interface CognitoConfig {
   userPoolId: string;
@@ -21,7 +24,13 @@ export interface CognitoConfig {
 export function configureAmplifyAuth(cognitoConfig: CognitoConfig): void {
   const currentOrigin = globalThis.location.origin;
 
-  Amplify.configure({
+  // Dev-only and unset in every deployment; trimmed so an empty .env.local entry reads as unset.
+  const localSessionEndpoint = (
+    import.meta.env.VITE_LOCAL_SESSION_ENDPOINT as string | undefined
+  )?.trim();
+
+  // Annotated because out of argument position `responseType` widens to string.
+  const resources: ResourcesConfig = {
     Auth: {
       Cognito: {
         userPoolId: cognitoConfig.userPoolId,
@@ -42,7 +51,19 @@ export function configureAmplifyAuth(cognitoConfig: CognitoConfig): void {
         },
       },
     },
-  });
+  };
+
+  // Two calls rather than one call with a second argument that is sometimes
+  // undefined: the deployed path stays the single-argument call it has always
+  // been, so nothing about it can drift with the local profile.
+  if (localSessionEndpoint) {
+    Amplify.configure(
+      resources,
+      localSessionLibraryOptions(localSessionEndpoint),
+    );
+  } else {
+    Amplify.configure(resources);
+  }
 
   cognitoUserPoolsTokenProvider.setKeyValueStorage(sessionStorage);
 }

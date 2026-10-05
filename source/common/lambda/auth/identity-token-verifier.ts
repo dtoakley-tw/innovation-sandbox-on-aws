@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import { Logger } from "@aws-lambda-powertools/logger";
 import { CognitoJwtVerifier } from "aws-jwt-verify";
+import { fetchJwks } from "aws-jwt-verify/jwk";
 import { APIGatewayProxyEvent } from "aws-lambda";
 
 import { IDENTITY_HEADER } from "@amzn/innovation-sandbox-shared/utils/auth-utils.js";
@@ -25,6 +26,12 @@ export class IdentityTokenError extends Error {
 export interface IdentityVerifierEnv {
   COGNITO_USER_POOL_ID: string;
   COGNITO_APP_CLIENT_ID: string;
+  /**
+   * Local development only. When set, JWKS is loaded from this URI instead of
+   * the Cognito endpoint derived from COGNITO_USER_POOL_ID, which is
+   * unreachable in the offline LocalStack profile. Unset in production.
+   */
+  ISB_LOCAL_JWKS_URI?: string;
 }
 
 // Cache the verifier across invocations: aws-jwt-verify holds the JWKS in
@@ -46,6 +53,30 @@ function getVerifier(env: IdentityVerifierEnv) {
     clientId: env.COGNITO_APP_CLIENT_ID,
   });
   return verifier;
+}
+
+// Resolved once per execution environment. Reset on failure so a transient
+// local-edge outage does not permanently poison verification for the life of
+// the container.
+let localJwksReady: Promise<void> | null = null;
+
+async function ensureLocalJwks(env: IdentityVerifierEnv): Promise<void> {
+  if (!env.ISB_LOCAL_JWKS_URI) return;
+  localJwksReady ??= fetchJwks(env.ISB_LOCAL_JWKS_URI)
+    .then((jwks) => {
+      // Seeds the in-memory cache keyed by the Cognito issuer derived from the
+      // pool id, so the verifier never issues the network request it would
+      // otherwise make. The two-argument form is deliberate: it throws if the
+      // pool id is not one of the verifier's configured issuers, where the
+      // one-argument form would silently miss. COGNITO_USER_POOL_ID is fixed for
+      // the life of an execution environment, so a mismatch is always a bug.
+      getVerifier(env).cacheJwks(jwks, env.COGNITO_USER_POOL_ID);
+    })
+    .catch((error: unknown) => {
+      localJwksReady = null;
+      throw error;
+    });
+  await localJwksReady;
 }
 
 // Format: cognito-idp.<region>.amazonaws.com/<pool>:CognitoSignIn:<sub>
@@ -73,6 +104,8 @@ export async function verifyAndExtractClaims(
   if (!token) {
     throw new IdentityTokenError("Missing", "Missing identity token.");
   }
+
+  await ensureLocalJwks(env);
 
   const payload = (await getVerifier(env)
     .verify(token)
