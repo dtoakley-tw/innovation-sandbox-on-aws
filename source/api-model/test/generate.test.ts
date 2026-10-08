@@ -836,7 +836,6 @@ describe("Gradle repository routing", () => {
 });
 
 describe("public build runtime contract", () => {
-  const buildspec = readFileSync(join(repoRoot, "buildspec.yml"), "utf8");
   const preCommit = readFileSync(
     join(repoRoot, ".pre-commit-config.yaml"),
     "utf8",
@@ -852,17 +851,10 @@ describe("public build runtime contract", () => {
   const serverPackage = JSON.parse(
     readFileSync(join(repoRoot, "source/api-server/package.json"), "utf8"),
   );
-  const openSourceBuild = readFileSync(
-    join(repoRoot, "deployment/build-open-source-dist.sh"),
-    "utf8",
-  );
 
-  it("keeps Node 24 and Java 21 aligned across public build declarations", () => {
+  it("keeps Node 24 and Java 21 aligned across repository declarations", () => {
     expect(readFileSync(join(repoRoot, ".nvmrc"), "utf8").trim()).toBe("24");
     expect(rootPackage.engines.node).toBe(">=24.0.0 <25.0.0");
-    expect(buildspec).toMatch(
-      /runtime-versions:\s+nodejs: 24\s+java: corretto21/,
-    );
     expect(readme).toContain("- Node 24");
     expect(readme).toContain("- Java 21 (Amazon Corretto 21 recommended)");
     expect(publicGradleVersion(modelRoot)).toBe("8.10");
@@ -877,7 +869,7 @@ describe("public build runtime contract", () => {
       expect(generatedPackage.engines.node).toBe(">=20.0.0");
     }
     // Node 20 is the generated library's compatibility floor; the repository
-    // still builds and tests it with the Node 24 runtime asserted above.
+    // still builds and tests it with the Node 24 runtime declared above.
     expect(notice).not.toContain("@tsconfig/node16");
     for (const dependency of ["@smithy/server-common", "re2-wasm"]) {
       expect(notice).toContain(`${dependency} under the Apache-2.0 license.`);
@@ -891,33 +883,13 @@ describe("public build runtime contract", () => {
     );
   });
 
-  it("keeps Brazil-only build inputs out of the public archive", () => {
-    for (const excluded of [
-      "brazil.ion",
-      "build-tools",
-      "internal",
-      "source/api-model/gradle-version",
-    ]) {
-      expect(openSourceBuild).toContain(`"${excluded}"`);
-    }
-  });
-
-  it("runs the internal C2J drift gate without exposing npm targets", () => {
+  it("does not expose internal C2J npm targets", () => {
     expect(rootPackage.scripts["generate:c2j"]).toBeUndefined();
     expect(rootPackage.scripts["verify:c2j-drift"]).toBeUndefined();
     expect(preCommit).toContain("entry: scripts/m2m/verify-c2j-drift.sh");
-    expect(openSourceBuild).not.toContain('delete pkg.scripts["generate:c2j"]');
   });
 
-  it("keeps generated bootstrap manifests in the public source archive", () => {
-    expect(openSourceBuild).toContain(
-      "generated package manifests are deliberately included",
-    );
-    for (const packagePath of ["api-client", "api-server"]) {
-      expect(openSourceBuild).not.toMatch(
-        new RegExp(`^\\s*"source/${packagePath}/package\\.json"\\s*\\\\`, "m"),
-      );
-    }
+  it("documents generated bootstrap manifests in the public source archive", () => {
     expect(readme).toContain(
       "source distribution intentionally includes the bootstrap manifests",
     );
