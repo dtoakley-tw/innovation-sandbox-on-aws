@@ -5,8 +5,7 @@ module "deployer_org" {
   }
 
   environment          = var.environment
-  github_repository    = var.github_repository
-  github_ref           = var.github_ref
+  github_subject       = var.github_subject
   create_oidc_provider = var.create_oidc_provider_org
 }
 
@@ -17,8 +16,7 @@ module "deployer_idc" {
   }
 
   environment          = var.environment
-  github_repository    = var.github_repository
-  github_ref           = var.github_ref
+  github_subject       = var.github_subject
   create_oidc_provider = var.create_oidc_provider_idc
 }
 
@@ -29,7 +27,6 @@ module "deployer_hub" {
   }
 
   environment          = var.environment
-  github_repository    = var.github_repository
-  github_ref           = var.github_ref
+  github_subject       = var.github_subject
   create_oidc_provider = var.create_oidc_provider_hub
 }

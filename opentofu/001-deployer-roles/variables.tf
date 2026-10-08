@@ -66,16 +66,10 @@ variable "hub_session_token" {
   default     = null
 }
 
-variable "github_repository" {
+variable "github_subject" {
   type        = string
-  description = "GitHub repository allowed to assume the deployer roles, in owner/name form"
-  default     = "dtoakley-tw/innovation-sandbox-on-aws"
-}
-
-variable "github_ref" {
-  type        = string
-  description = "Git ref allowed to assume the deployer roles"
-  default     = "refs/heads/main"
+  description = "Exact OIDC sub claim allowed to assume the deployer roles. Uses GitHub's immutable ID format."
+  default     = "repo:dtoakley-tw@69360383/innovation-sandbox-on-aws@1383516308:ref:refs/heads/main"
 }
 
 variable "create_oidc_provider_org" {

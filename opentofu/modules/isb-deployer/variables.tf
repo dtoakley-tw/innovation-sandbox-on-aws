@@ -3,14 +3,9 @@ variable "environment" {
   description = "The environment name used in role names"
 }
 
-variable "github_repository" {
+variable "github_subject" {
   type        = string
-  description = "GitHub repository allowed to assume the deployer role, in owner/name form"
-}
-
-variable "github_ref" {
-  type        = string
-  description = "Git ref allowed to assume the deployer role, e.g. refs/heads/main"
+  description = "Exact OIDC sub claim allowed to assume the deployer role. Uses GitHub's immutable ID format, e.g. repo:owner@ownerId/repo@repoId:ref:refs/heads/main"
 }
 
 variable "create_oidc_provider" {
