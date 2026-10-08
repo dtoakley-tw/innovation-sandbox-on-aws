@@ -1,4 +1,4 @@
-name: 'Initial Boostrap for Sandbox Infrastructure'
+name: 'Initial Bootstrap for Sandbox Infrastructure'
 
 on:
   workflow_dispatch:
@@ -13,12 +13,11 @@ env:
   OPENTOFU_DIRECTORY: opentofu
 
 jobs:
-  boostrap-infra:
-    name: 'Boostrap initial infrastructure'
+  bootstrap-infra:
+    name: 'Bootstrap initial infrastructure'
     runs-on: ubuntu-24.04
     outputs:
       s3_bucket_name: ${{ steps.opentofu-backend.outputs.s3_bucket_name }}
-      initial_iam_role: ${{ steps.initial-bootstrap.outputs.role_arn }}
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -30,22 +29,6 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
 #          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
           aws-region: ${{ env.AWS_REGION }}
-
-      - name: Setup Node
-        # run this from the deployer role instead of the admin role
-        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        with:
-          node-version-file: .nvmrc
-
-      - name: Install CDK dependencies
-        run: npm ci
-
-      - name: CDK Bootstrap (management account)
-        env:
-          AWS_REGION: ${{ env.AWS_REGION }}
-        run: |
-          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-          npx cdk bootstrap "aws://${ACCOUNT_ID}/${AWS_REGION}"
 
       - name: Setup OpenTofu
         uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # v2.0.2
@@ -75,18 +58,16 @@ jobs:
           tofu plan -out=tfplan
           tofu apply -auto-approve tfplan
 
-#      - name: Setup iamlive
-#        uses: marcofranssen/setup-iamlive@0f86f95f5bb92f437832f79548f92c2968f65962 # v2.0.0
-#        with:
-#          iamlive-version: v1.1.24
-#          auto-capture: true
-#          output-file: ./initial-setup-iamlive-policy-${{ env.ENVIRONMENT }}.json
-
-      - name: Create IAM Initial Role and Policies
-        working-directory: ${{ env.OPENTOFU_DIRECTORY }}/001-iam-initial-role
-        id: initial-bootstrap
+      - name: Create Deployer Roles
+        working-directory: ${{ env.OPENTOFU_DIRECTORY }}/001-deployer-roles
         env:
           TF_VAR_environment: ${{ env.ENVIRONMENT }}
+          TF_VAR_org_access_key_id: ${{ secrets.ORG_MGT_AWS_ACCESS_KEY_ID }}
+          TF_VAR_org_secret_access_key: ${{ secrets.ORG_MGT_AWS_SECRET_ACCESS_KEY }}
+          TF_VAR_idc_access_key_id: ${{ secrets.IDC_AWS_ACCESS_KEY_ID }}
+          TF_VAR_idc_secret_access_key: ${{ secrets.IDC_AWS_SECRET_ACCESS_KEY }}
+          TF_VAR_hub_access_key_id: ${{ secrets.HUB_AWS_ACCESS_KEY_ID }}
+          TF_VAR_hub_secret_access_key: ${{ secrets.HUB_AWS_SECRET_ACCESS_KEY }}
         run: |
           tofu init --backend-config="bucket=${{ env.TF_VAR_bucket_name }}" --backend-config="region=${{ env.AWS_REGION }}"
           tofu fmt -check
@@ -94,13 +75,20 @@ jobs:
           tofu plan -var-file="../configs/opentofu-${{ env.ENVIRONMENT }}.tfvars" -out=tfplan
           tofu apply -auto-approve tfplan
 
+#      - name: Setup iamlive
+#        uses: marcofranssen/setup-iamlive@0f86f95f5bb92f437832f79548f92c2968f65962 # v2.0.0
+#        with:
+#          iamlive-version: v1.1.24
+#          auto-capture: true
+#          output-file: ./initial-setup-iamlive-policy-${{ env.ENVIRONMENT }}.json
+
 #      - name: Debug - List files
 #        if: always()
 #        run: |
 #          echo "Files in root directory:"
 #          ls -la ./initial-setup-iamlive-policy*.json || echo "No iamlive policy files found in root"
 #          echo "Files in working directory:"
-#          ls -la ${{ env.OPENTOFU_DIRECTORY }}/001-iam-initial-role/initial-setup-iamlive-policy*.json || echo "No iamlive policy files found in working directory"
+#          ls -la ${{ env.OPENTOFU_DIRECTORY }}/001-deployer-roles/initial-setup-iamlive-policy*.json || echo "No iamlive policy files found in working directory"
 #
 #      - name: Upload IAM Live Policy
 #        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -109,3 +97,33 @@ jobs:
 #          name: initial-setup-iamlive-policy-${{ env.ENVIRONMENT }}-${{ github.run_id }}
 #          path: ./initial-setup-iamlive-policy-${{ env.ENVIRONMENT }}.json
 #          retention-days: 1
+
+  cdk-bootstrap:
+    name: 'CDK Bootstrap (${{ matrix.account }})'
+    needs: bootstrap-infra
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        account: [org, idc, hub]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+
+      - name: Install CDK dependencies
+        run: npm ci
+
+      - name: CDK Bootstrap
+        env:
+          AWS_REGION: ${{ env.AWS_REGION }}
+          AWS_ACCESS_KEY_ID: ${{ matrix.account == 'org' && secrets.ORG_MGT_AWS_ACCESS_KEY_ID || matrix.account == 'idc' && secrets.IDC_AWS_ACCESS_KEY_ID || matrix.account == 'hub' && secrets.HUB_AWS_ACCESS_KEY_ID || '' }}
+          AWS_SECRET_ACCESS_KEY: ${{ matrix.account == 'org' && secrets.ORG_MGT_AWS_SECRET_ACCESS_KEY || matrix.account == 'idc' && secrets.IDC_AWS_SECRET_ACCESS_KEY || matrix.account == 'hub' && secrets.HUB_AWS_SECRET_ACCESS_KEY || '' }}
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          echo "Bootstrapping ${{ matrix.account }} account ${ACCOUNT_ID} in ${AWS_REGION}"
+          npx cdk bootstrap "aws://${ACCOUNT_ID}/${AWS_REGION}"

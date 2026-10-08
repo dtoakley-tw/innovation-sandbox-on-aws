@@ -66,3 +66,5 @@ source/api-client/dist-*/
 source/api-client/tsconfig*.json
 source/api-server/domains/
 source/api-server/dist-*/
+
+*.terraform
