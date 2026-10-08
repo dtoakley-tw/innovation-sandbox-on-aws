@@ -21,6 +21,13 @@ variable "org_secret_access_key" {
   sensitive   = true
 }
 
+variable "org_session_token" {
+  type        = string
+  description = "Session token for the Org Management account. Required for temporary (SSO) credentials; null for IAM user keys."
+  sensitive   = true
+  default     = null
+}
+
 variable "idc_access_key_id" {
   type        = string
   description = "Access key ID for the IDC account"
@@ -33,6 +40,13 @@ variable "idc_secret_access_key" {
   sensitive   = true
 }
 
+variable "idc_session_token" {
+  type        = string
+  description = "Session token for the IDC account. Required for temporary (SSO) credentials; null for IAM user keys."
+  sensitive   = true
+  default     = null
+}
+
 variable "hub_access_key_id" {
   type        = string
   description = "Access key ID for the Hub account"
@@ -43,6 +57,13 @@ variable "hub_secret_access_key" {
   type        = string
   description = "Secret access key for the Hub account"
   sensitive   = true
+}
+
+variable "hub_session_token" {
+  type        = string
+  description = "Session token for the Hub account. Required for temporary (SSO) credentials; null for IAM user keys."
+  sensitive   = true
+  default     = null
 }
 
 variable "github_repository" {

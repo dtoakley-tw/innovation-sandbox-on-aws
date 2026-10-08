@@ -27,7 +27,7 @@ jobs:
         with:
           aws-access-key-id: ${{ secrets.ORG_MGT_AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.ORG_MGT_AWS_SECRET_ACCESS_KEY }}
-#          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-session-token: ${{ secrets.ORG_MGT_AWS_SESSION_TOKEN }}
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Setup OpenTofu
@@ -64,10 +64,13 @@ jobs:
           TF_VAR_environment: ${{ env.ENVIRONMENT }}
           TF_VAR_org_access_key_id: ${{ secrets.ORG_MGT_AWS_ACCESS_KEY_ID }}
           TF_VAR_org_secret_access_key: ${{ secrets.ORG_MGT_AWS_SECRET_ACCESS_KEY }}
+          TF_VAR_org_session_token: ${{ secrets.ORG_MGT_AWS_SESSION_TOKEN }}
           TF_VAR_idc_access_key_id: ${{ secrets.IDC_AWS_ACCESS_KEY_ID }}
           TF_VAR_idc_secret_access_key: ${{ secrets.IDC_AWS_SECRET_ACCESS_KEY }}
+          TF_VAR_idc_session_token: ${{ secrets.IDC_AWS_SESSION_TOKEN }}
           TF_VAR_hub_access_key_id: ${{ secrets.HUB_AWS_ACCESS_KEY_ID }}
           TF_VAR_hub_secret_access_key: ${{ secrets.HUB_AWS_SECRET_ACCESS_KEY }}
+          TF_VAR_hub_session_token: ${{ secrets.HUB_AWS_SESSION_TOKEN }}
         run: |
           tofu init --backend-config="bucket=${{ env.TF_VAR_bucket_name }}" --backend-config="region=${{ env.AWS_REGION }}"
           tofu fmt -check
@@ -123,7 +126,10 @@ jobs:
           AWS_REGION: ${{ env.AWS_REGION }}
           AWS_ACCESS_KEY_ID: ${{ matrix.account == 'org' && secrets.ORG_MGT_AWS_ACCESS_KEY_ID || matrix.account == 'idc' && secrets.IDC_AWS_ACCESS_KEY_ID || matrix.account == 'hub' && secrets.HUB_AWS_ACCESS_KEY_ID || '' }}
           AWS_SECRET_ACCESS_KEY: ${{ matrix.account == 'org' && secrets.ORG_MGT_AWS_SECRET_ACCESS_KEY || matrix.account == 'idc' && secrets.IDC_AWS_SECRET_ACCESS_KEY || matrix.account == 'hub' && secrets.HUB_AWS_SECRET_ACCESS_KEY || '' }}
+          AWS_SESSION_TOKEN: ${{ matrix.account == 'org' && secrets.ORG_MGT_AWS_SESSION_TOKEN || matrix.account == 'idc' && secrets.IDC_AWS_SESSION_TOKEN || matrix.account == 'hub' && secrets.HUB_AWS_SESSION_TOKEN || '' }}
         run: |
+          # An empty session token would be sent as a blank value, so drop it for IAM user keys.
+          if [ -z "$AWS_SESSION_TOKEN" ]; then unset AWS_SESSION_TOKEN; fi
           ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
           echo "Bootstrapping ${{ matrix.account }} account ${ACCOUNT_ID} in ${AWS_REGION}"
           npx cdk bootstrap "aws://${ACCOUNT_ID}/${AWS_REGION}"
