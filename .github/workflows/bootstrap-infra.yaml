@@ -9,8 +9,6 @@ permissions:
 env:
   AWS_REGION: us-east-1
   TF_VAR_bucket_name: sandbox-infra-opentofu-alpha-us-east-1
-  OLD_BUCKET_NAME: sandbox-infra-opentofu-alpha
-  OLD_BUCKET_REGION: us-west-2
   ENVIRONMENT: alpha
   OPENTOFU_DIRECTORY: opentofu
 
@@ -59,17 +57,6 @@ jobs:
           tofu validate
           tofu plan -out=tfplan
           tofu apply -auto-approve tfplan
-
-      - name: Copy OpenTofu state to new bucket
-        # One-time migration from the us-west-2 bucket. Skips if the state object already exists in the new bucket.
-        run: |
-          STATE_KEY=deployer-roles.tfstate
-          if aws s3api head-object --bucket "${{ env.TF_VAR_bucket_name }}" --key "$STATE_KEY" >/dev/null 2>&1; then
-            echo "State already present in ${{ env.TF_VAR_bucket_name }}, skipping copy."
-            exit 0
-          fi
-          aws s3 cp "s3://${{ env.OLD_BUCKET_NAME }}/${STATE_KEY}" "s3://${{ env.TF_VAR_bucket_name }}/${STATE_KEY}" \
-            --source-region "${{ env.OLD_BUCKET_REGION }}" --region "${{ env.AWS_REGION }}"
 
       - name: Create Deployer Roles
         working-directory: ${{ env.OPENTOFU_DIRECTORY }}/001-deployer-roles
