@@ -1,0 +1,170 @@
+name: 'Deploy Innovation Sandbox Stacks'
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy. Settings are read from .env.<environment>'
+        type: choice
+        required: true
+        options:
+          - alpha
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-stacks-${{ inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  load-config:
+    name: 'Load ${{ inputs.environment }} config'
+    runs-on: ubuntu-24.04
+    outputs:
+      deploy_region: ${{ steps.config.outputs.deploy_region }}
+      org_mgt_role_arn: ${{ steps.config.outputs.org_mgt_role_arn }}
+      idc_role_arn: ${{ steps.config.outputs.idc_role_arn }}
+      hub_role_arn: ${{ steps.config.outputs.hub_role_arn }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Read environment config
+        id: config
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+        run: |
+          set -a
+          . "./.env.${ENVIRONMENT}"
+          set +a
+          : "${DEPLOY_REGION:?DEPLOY_REGION is not set in .env.${ENVIRONMENT}}"
+          : "${ORG_MGT_ACCOUNT_ID:?ORG_MGT_ACCOUNT_ID is not set in .env.${ENVIRONMENT}}"
+          : "${IDC_ACCOUNT_ID:?IDC_ACCOUNT_ID is not set in .env.${ENVIRONMENT}}"
+          : "${HUB_ACCOUNT_ID:?HUB_ACCOUNT_ID is not set in .env.${ENVIRONMENT}}"
+          {
+            echo "deploy_region=${DEPLOY_REGION}"
+            echo "org_mgt_role_arn=arn:aws:iam::${ORG_MGT_ACCOUNT_ID}:role/${ENVIRONMENT}_isb_deployer"
+            echo "idc_role_arn=arn:aws:iam::${IDC_ACCOUNT_ID}:role/${ENVIRONMENT}_isb_deployer"
+            echo "hub_role_arn=arn:aws:iam::${HUB_ACCOUNT_ID}:role/${ENVIRONMENT}_isb_deployer"
+          } >> "$GITHUB_OUTPUT"
+
+  deploy-account-pool:
+    name: 'Deploy AccountPool (${{ inputs.environment }})'
+    needs: load-config
+    runs-on: ubuntu-24.04
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Configure AWS Credentials (Org Management)
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ needs.load-config.outputs.org_mgt_role_arn }}
+          aws-region: ${{ needs.load-config.outputs.deploy_region }}
+
+      - name: Setup Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Deploy AccountPool stack
+        run: |
+          cp ".env.${{ inputs.environment }}" .env
+          npm run deploy:account-pool
+
+  deploy-idc:
+    name: 'Deploy IDC (${{ inputs.environment }})'
+    needs: [load-config, deploy-account-pool]
+    runs-on: ubuntu-24.04
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Configure AWS Credentials (IDC)
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ needs.load-config.outputs.idc_role_arn }}
+          aws-region: ${{ needs.load-config.outputs.deploy_region }}
+
+      - name: Setup Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Deploy IDC stack
+        run: |
+          cp ".env.${{ inputs.environment }}" .env
+          npm run deploy:idc
+
+  deploy-data:
+    name: 'Deploy Data (${{ inputs.environment }})'
+    needs: [load-config, deploy-idc]
+    runs-on: ubuntu-24.04
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Configure AWS Credentials (Hub)
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ needs.load-config.outputs.hub_role_arn }}
+          aws-region: ${{ needs.load-config.outputs.deploy_region }}
+
+      - name: Setup Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Deploy Data stack
+        run: |
+          cp ".env.${{ inputs.environment }}" .env
+          npm run deploy:data
+
+  deploy-compute:
+    name: 'Deploy Compute (${{ inputs.environment }})'
+    needs: [load-config, deploy-data]
+    runs-on: ubuntu-24.04
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Configure AWS Credentials (Hub)
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ needs.load-config.outputs.hub_role_arn }}
+          aws-region: ${{ needs.load-config.outputs.deploy_region }}
+
+      - name: Setup Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Deploy Compute stack
+        run: |
+          cp ".env.${{ inputs.environment }}" .env
+          npm run deploy:compute

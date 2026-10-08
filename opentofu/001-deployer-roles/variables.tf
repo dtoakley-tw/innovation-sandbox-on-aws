@@ -6,7 +6,7 @@ variable "environment" {
 variable "aws_region" {
   type        = string
   description = "Region for the AWS provider (IAM is global; this must still be set)"
-  default     = "us-west-2"
+  default     = "us-east-1"
 }
 
 variable "org_access_key_id" {
